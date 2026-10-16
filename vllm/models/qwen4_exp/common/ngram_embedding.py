@@ -51,6 +51,7 @@ class Qwen4ExpPLEEmbedding(PLEVocabParallelEmbedding, ABC):
     """ETP-sharded PLE table shared by device and pinned-host backends."""
 
     supports_prefetch: ClassVar[bool] = False
+    prefetch_at_forward_start: ClassVar[bool] = False
 
     def __init__(
         self,
@@ -146,11 +147,21 @@ class Qwen4ExpPLEEmbedding(PLEVocabParallelEmbedding, ABC):
             return embeddings
         return embeddings.narrow(0, slot_offset, local_num_tokens)
 
+    def get_prefetch_ids_buffer(
+        self,
+        max_total_tokens: int,
+        num_ngram_heads: int,
+    ) -> torch.Tensor:
+        """Allocate storage that receives the row ids of a prefetch."""
+        return torch.empty(max_total_tokens, num_ngram_heads, dtype=torch.long)
+
     @abstractmethod
     def start_prefetch(
         self,
-        hidden_states: torch.Tensor,
+        hidden_states: torch.Tensor | None,
         ngram_ids: torch.Tensor,
+        *,
+        query_start_loc: torch.Tensor | None = None,
     ) -> None:
         """Start an asynchronous lookup when supported."""
         raise NotImplementedError
@@ -334,8 +345,10 @@ class Qwen4ExpPLEDeviceEmbedding(Qwen4ExpPLEEmbedding):
 
     def start_prefetch(
         self,
-        hidden_states: torch.Tensor,
+        hidden_states: torch.Tensor | None,
         ngram_ids: torch.Tensor,
+        *,
+        query_start_loc: torch.Tensor | None = None,
     ) -> None:
         """Resident embedding prefetch is a no-op."""
         return None
@@ -502,10 +515,13 @@ class Qwen4ExpPLEPinnedHostEmbedding(Qwen4ExpPLEEmbedding):
     @eager_break_during_capture
     def start_prefetch(
         self,
-        hidden_states: torch.Tensor,
+        hidden_states: torch.Tensor | None,
         ngram_ids: torch.Tensor,
+        *,
+        query_start_loc: torch.Tensor | None = None,
     ) -> None:
         """Gather ETP IDs and launch their UVA lookup on the side stream."""
+        del query_start_loc
         slot_size, _ = self._get_dp_gather_slot(ngram_ids.shape[0])
         gathered_ids = self._gather_dp_ids(ngram_ids, slot_size)
         active_output = self._prefetch_buffer[: gathered_ids.shape[0]]

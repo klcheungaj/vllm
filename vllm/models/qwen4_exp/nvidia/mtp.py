@@ -48,6 +48,7 @@ from vllm.transformers_utils.configs.qwen4_exp import (
     Qwen4ExpTextConfig,
 )
 
+from ..common.ple_disk import is_ple_shard_checkpoint_weight
 from .hyperconnection import GatedResidual, HyperConnectionConfig
 from .low_latency_gemm import enable_qwen4_exp_low_latency_gemm
 from .model import (
@@ -435,6 +436,10 @@ class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
         self, hidden_states: torch.Tensor, spec_step_idx: int = 0
     ) -> torch.Tensor | None:
         return self.logits_processor(self.lm_head, hidden_states)
+
+    def should_skip_checkpoint_weight(self, name: str) -> bool:
+        """Leave the backbone PLE rows unread; the draft model has no PLE."""
+        return is_ple_shard_checkpoint_weight(name)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         def remap_weight_names():

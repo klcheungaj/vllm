@@ -180,7 +180,7 @@ steps:
   commands:
     - pytest -v -s models/qwen4_exp/test_hc_ops.py models/qwen4_exp/test_qsa_pre_indexer.py models/qwen4_exp/test_qsa_reference.py
     # PLE and QSA import conflicting HC registrations in a shared process.
-    - pytest -v -s models/qwen4_exp/test_ple_disk_reader.py
+    - pytest -v -s models/qwen4_exp/test_ple_disk_reader.py models/qwen4_exp/test_ple_disk.py
   mirror:
     amd:
       label: ":amd: (MI355 DPX) Qwen4 Exp"

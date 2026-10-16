@@ -247,6 +247,11 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             getattr(config, "ple_embedding_dtype", None),
         )
         engram_config = get_current_vllm_config().engram_config
+        if engram_config is not None and engram_config.disk_offload:
+            raise NotImplementedError(
+                "Engram disk_offload is not supported by the ROCm Qwen4Exp "
+                "implementation; use cpu_offload instead."
+            )
         embedding_cls = (
             Qwen4ExpPLEPinnedHostEmbedding
             if engram_config is not None and engram_config.cpu_offload

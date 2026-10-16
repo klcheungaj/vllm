@@ -7,7 +7,7 @@ from collections.abc import Iterable
 import torch
 from torch import nn
 
-from vllm.config import get_current_vllm_config
+from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
@@ -25,6 +25,7 @@ from ..common.ngram_embedding import (
     Qwen4ExpPLEPinnedHostEmbedding,
     Qwen4ExpPLEUnquantizedEmbeddingMethod,
 )
+from ..common.ple_disk import Qwen4ExpPLEDiskEmbedding, resolve_local_model_dir
 from .ops.ple import ple_ngram_ids
 
 logger = init_logger(__name__)
@@ -38,6 +39,20 @@ __all__ = [
     "Qwen4ExpPLEUnquantizedEmbeddingMethod",
     "Qwen4ExpNGramEmbedding",
 ]
+
+
+def open_ple_disk_sources(model: nn.Module, vllm_config: VllmConfig) -> None:
+    """Open the checkpoint row readers of every disk-offloaded PLE table."""
+    embeddings = [
+        module
+        for module in model.modules()
+        if isinstance(module, Qwen4ExpNGramEmbedding) and module.uses_disk_offload
+    ]
+    if not embeddings:
+        return
+    model_dir = resolve_local_model_dir(vllm_config)
+    for embedding in embeddings:
+        embedding.open_disk_source(model_dir)
 
 
 class Qwen4ExpNGramEmbedding(nn.Module):
@@ -208,11 +223,13 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         if params_dtype is None:
             params_dtype = torch.get_default_dtype()
         engram_config = get_current_vllm_config().engram_config
-        embedding_cls = (
-            Qwen4ExpPLEPinnedHostEmbedding
-            if engram_config is not None and engram_config.cpu_offload
-            else Qwen4ExpPLEDeviceEmbedding
-        )
+        embedding_cls: type[Qwen4ExpPLEEmbedding]
+        if engram_config is not None and engram_config.disk_offload:
+            embedding_cls = Qwen4ExpPLEDiskEmbedding
+        elif engram_config is not None and engram_config.cpu_offload:
+            embedding_cls = Qwen4ExpPLEPinnedHostEmbedding
+        else:
+            embedding_cls = Qwen4ExpPLEDeviceEmbedding
         self.ngram_embedding = embedding_cls(
             padded_vocab_size,
             self.head_dim,
@@ -227,19 +244,28 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         if self.ngram_embedding.supports_prefetch:
             # The side-stream lookup outlives eager-break args, whose
             # graph-pool storage later segments may reuse.
-            self._prefetch_ids = torch.empty(
-                max_total_tokens, self.ngram_heads, dtype=torch.long
+            self._prefetch_ids = self.ngram_embedding.get_prefetch_ids_buffer(
+                max_total_tokens, self.ngram_heads
             )
-        weight = self.ngram_embedding.weight
-        logger.info(
-            "Initialized PLE embedding %s: quantization_method=%s, "
-            "weight_dtype=%s, weight_device=%s, pinned=%s",
-            embedding_prefix,
-            type(embedding_quant_method).__name__,
-            weight.dtype,
-            weight.device,
-            weight.is_pinned(),
-        )
+        if isinstance(self.ngram_embedding, Qwen4ExpPLEDiskEmbedding):
+            logger.info(
+                "Initialized PLE embedding %s: quantization_method=%s, "
+                "weight_dtype=%s, disk_offload=True",
+                embedding_prefix,
+                type(embedding_quant_method).__name__,
+                self.ngram_embedding.storage_dtype,
+            )
+        else:
+            weight = self.ngram_embedding.weight
+            logger.info(
+                "Initialized PLE embedding %s: quantization_method=%s, "
+                "weight_dtype=%s, weight_device=%s, pinned=%s",
+                embedding_prefix,
+                type(embedding_quant_method).__name__,
+                weight.dtype,
+                weight.device,
+                weight.is_pinned(),
+            )
 
     @staticmethod
     def _shift_precompute(
@@ -365,12 +391,12 @@ class Qwen4ExpNGramEmbedding(nn.Module):
 
     def start_prefetch(
         self,
-        hidden_states: torch.Tensor,
+        hidden_states: torch.Tensor | None,
         input_ids: torch.Tensor,
         query_start_loc: torch.Tensor,
         ngram_context: torch.Tensor,
     ) -> None:
-        """Start the pinned lookup while the preceding decoder layer runs."""
+        """Start the offloaded lookup ahead of the PLE layer."""
         embedding = self.ngram_embedding
         if not embedding.supports_prefetch:
             return
@@ -380,7 +406,20 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             ngram_context,
             output=self._prefetch_ids[: input_ids.numel()],
         )
-        embedding.start_prefetch(hidden_states, ngram_ids)
+        embedding.start_prefetch(
+            hidden_states, ngram_ids, query_start_loc=query_start_loc
+        )
+
+    @property
+    def uses_disk_offload(self) -> bool:
+        return isinstance(self.ngram_embedding, Qwen4ExpPLEDiskEmbedding)
+
+    def open_disk_source(self, model_dir: str) -> None:
+        """Start reading this layer's table rows from the checkpoint files."""
+        assert isinstance(self.ngram_embedding, Qwen4ExpPLEDiskEmbedding)
+        self.ngram_embedding.open_disk_source(
+            model_dir, split_ngram_parts=self.split_ngram_parts
+        )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load hash buffers and checkpoint-split embedding rows."""
@@ -411,6 +450,9 @@ class Qwen4ExpNGramEmbedding(nn.Module):
                 shard_text = name[len(shard_prefix) : -len(".weight")]
                 if not shard_text.isdigit():
                     regular_weights.append((name, loaded_weight))
+                    continue
+                if self.uses_disk_offload:
+                    # Disk offload reads the rows from the checkpoint files.
                     continue
                 shard_index = int(shard_text)
                 if shard_index >= self.split_ngram_parts:
@@ -450,4 +492,5 @@ class Qwen4ExpNGramEmbedding(nn.Module):
 
 __all__ = [
     "Qwen4ExpNGramEmbedding",
+    "open_ple_disk_sources",
 ]

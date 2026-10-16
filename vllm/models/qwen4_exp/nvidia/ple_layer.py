@@ -153,12 +153,12 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
 
     def start_prefetch(
         self,
-        hidden_states: torch.Tensor,
+        hidden_states: torch.Tensor | None,
         input_ids: torch.Tensor,
         query_start_loc: torch.Tensor,
         ngram_context: torch.Tensor,
     ) -> None:
-        """Start the pinned PLE lookup while the preceding decoder layer runs."""
+        """Start the offloaded PLE lookup ahead of this layer."""
         self.ple_embedding.start_prefetch(
             hidden_states,
             input_ids,

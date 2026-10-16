@@ -4,14 +4,19 @@
 
 from typing import Any
 
+import numpy as np
 import torch
 import torch.nn as nn
 
 from vllm.config import VllmConfig
+from vllm.v1.core.sched.output import NewRequestData
 from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
 from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridModelState
 from vllm.v1.worker.gpu.states import RequestState
+
+from ..common.ple_disk import Qwen4ExpPLEDiskEmbedding, ple_ngram_row_ids_np
+from .ngram_embedding import Qwen4ExpNGramEmbedding
 
 
 class Qwen4ExpModelState(MambaHybridModelState):
@@ -27,6 +32,22 @@ class Qwen4ExpModelState(MambaHybridModelState):
         super().__init__(vllm_config, model, encoder_cache, device)
         config = self.model_config.hf_text_config
         self.uses_ngram_embedding = bool(config.ple_layer_ids)
+        engram_config = vllm_config.engram_config
+        self.ple_disk_offload = bool(
+            self.uses_ngram_embedding
+            and engram_config is not None
+            and engram_config.disk_offload
+        )
+        self.ple_disk_hints = bool(
+            self.ple_disk_offload
+            and engram_config is not None
+            and engram_config.disk_prefetch_hints
+        )
+        # (embedding, hash parameters) of each disk-offloaded PLE layer.
+        self.ple_disk_layers: list[tuple[Qwen4ExpPLEDiskEmbedding, dict[str, Any]]]
+        self.ple_disk_layers = []
+        self.ple_disk_layers_resolved = False
+        self.prefill_token_ids: dict[str, np.ndarray] = {}
         if not self.uses_ngram_embedding:
             self.ngram_context_len = 0
             self.ngram_eos_token_id = 0
@@ -64,6 +85,67 @@ class Qwen4ExpModelState(MambaHybridModelState):
             device=self.device,
         )
 
+    def add_request(self, req_index: int, new_req_data: NewRequestData) -> None:
+        super().add_request(req_index, new_req_data)
+        if self.ple_disk_hints:
+            assert new_req_data.prefill_token_ids is not None
+            self.prefill_token_ids[new_req_data.req_id] = np.asarray(
+                new_req_data.prefill_token_ids, dtype=np.int64
+            )
+
+    def remove_request(self, req_id: str) -> None:
+        super().remove_request(req_id)
+        self.prefill_token_ids.pop(req_id, None)
+
+    def _get_ple_disk_layers(
+        self,
+    ) -> list[tuple[Qwen4ExpPLEDiskEmbedding, dict[str, Any]]]:
+        if not self.ple_disk_layers_resolved:
+            # Resolved lazily: the hash buffers load after this state exists.
+            for module in self.model.modules():
+                if not isinstance(module, Qwen4ExpNGramEmbedding):
+                    continue
+                embedding = module.ngram_embedding
+                if not isinstance(embedding, Qwen4ExpPLEDiskEmbedding):
+                    continue
+                params = {
+                    "layer_multipliers": module.layer_multipliers.cpu().numpy(),
+                    "ngram_heads_vocab_sizes": (
+                        module.ngram_heads_vocab_sizes.cpu().numpy()
+                    ),
+                    "ngram_heads_offsets": module.ngram_heads_offsets.cpu().numpy(),
+                    "eos_token_id": module.eos_token_id,
+                    "heads_per_ngram": module.heads_per_ngram,
+                }
+                self.ple_disk_layers.append((embedding, params))
+            self.ple_disk_layers_resolved = True
+        return self.ple_disk_layers
+
+    def _service_ple_disk(self, input_batch: InputBatch) -> None:
+        """Surface reader failures and hint upcoming prefill rows.
+
+        Hints cover this step's prefill chunk and the next one of the same
+        length. The CPU prepares a step ahead of the GPU, so these advisory
+        reads overlap earlier compute. Decode rows are left to demand reads.
+        """
+        layers = self._get_ple_disk_layers()
+        for embedding, _ in layers:
+            embedding.check_error()
+        if not self.ple_disk_hints:
+            return
+        num_reqs = input_batch.num_reqs
+        for batch_idx in np.flatnonzero(input_batch.is_prefilling_np[:num_reqs]):
+            tokens = self.prefill_token_ids.get(input_batch.req_ids[batch_idx])
+            if tokens is None:
+                continue
+            start = int(input_batch.num_computed_prefill_tokens_np[batch_idx])
+            chunk_len = int(input_batch.num_scheduled_tokens[batch_idx])
+            end = min(start + 2 * chunk_len, tokens.shape[0])
+            if start >= end:
+                continue
+            for embedding, params in layers:
+                embedding.hint_rows(ple_ngram_row_ids_np(tokens, start, end, **params))
+
     def _prepare_ngram_context(
         self,
         input_batch: InputBatch,
@@ -100,6 +182,8 @@ class Qwen4ExpModelState(MambaHybridModelState):
         model_inputs = super().prepare_inputs(input_batch, req_states)
         if not self.uses_ngram_embedding:
             return model_inputs
+        if self.ple_disk_offload:
+            self._service_ple_disk(input_batch)
 
         num_reqs_padded = input_batch.num_reqs_after_padding
         query_start_loc = self.ple_query_start_loc

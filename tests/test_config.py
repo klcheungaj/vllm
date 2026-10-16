@@ -1721,8 +1721,85 @@ def test_engram_hash_tracks_execution_options():
         EngramConfig(cpu_offload=False),
         EngramConfig(cpu_offload=True, embedding_across_dp=True),
         EngramConfig(cpu_offload=True, dp_shared_memory=True),
+        EngramConfig(cpu_offload=True, disk_offload=True),
     ]
     assert len({config.compute_hash() for config in configs}) == len(configs)
+
+
+def test_engram_disk_tunables_keep_compile_hash():
+    """Retuning disk I/O must not invalidate compiled artifacts."""
+    tuned = EngramConfig(
+        disk_offload=True,
+        disk_row_cache_rows=0,
+        disk_io_threads=4,
+        disk_max_inflight=8,
+        disk_direct_io=False,
+        disk_prefetch_hints=False,
+        disk_wait_timeout_s=1.0,
+    )
+    assert tuned.compute_hash() == EngramConfig(disk_offload=True).compute_hash()
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        {"use_thp": True},
+        {"dp_shared_memory": True},
+        {"disk_row_cache_rows": -1},
+        {"disk_io_threads": 0},
+        {"disk_max_inflight": 0},
+        {"disk_wait_timeout_s": 0.0},
+    ],
+)
+def test_engram_disk_offload_rejects_invalid_options(options):
+    with pytest.raises(ValidationError):
+        EngramConfig(disk_offload=True, **options)
+
+
+@pytest.mark.parametrize(
+    "architecture, platform, error",
+    [
+        ("Qwen4ExpForConditionalGeneration", "cuda", None),
+        ("Qwen4ExpForCausalLM", "rocm", "requires CUDA"),
+        ("DeepseekV41ForCausalLM", "cuda", "only supported for Qwen4Exp"),
+    ],
+)
+def test_engram_disk_offload_model_support(monkeypatch, architecture, platform, error):
+    monkeypatch.setattr(current_platform, "is_cuda", lambda: platform == "cuda")
+    monkeypatch.setattr(current_platform, "is_cuda_alike", lambda: True)
+    model = cast(
+        ModelConfig,
+        SimpleNamespace(
+            architecture=architecture,
+            hf_text_config=SimpleNamespace(ple_layer_ids=[2], engram_layer_ids=[2]),
+        ),
+    )
+    config = EngramConfig(disk_offload=True)
+    if error is None:
+        config.verify_model_config(model)
+    else:
+        with pytest.raises(ValueError, match=error):
+            config.verify_model_config(model)
+
+
+@pytest.mark.parametrize(
+    "parallel_options",
+    [
+        {},
+        {"tensor_parallel_size": 2},
+        {"data_parallel_size": 2},
+    ],
+)
+def test_engram_disk_offload_requires_single_embedding_rank(parallel_options):
+    parallel = ParallelConfig(distributed_executor_backend="mp", **parallel_options)
+    config = EngramConfig(disk_offload=True)
+    config.resolve_dp_shared_memory(parallel)
+    assert config.dp_shared_memory is False
+    if parallel_options:
+        with pytest.raises(ValueError, match="disk_offload requires"):
+            config.verify_parallel_config(parallel)
+    else:
+        config.verify_parallel_config(parallel)
 
 
 @pytest.mark.parametrize("port", [1, 29550, 65535])

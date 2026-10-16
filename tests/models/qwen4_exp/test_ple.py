@@ -17,6 +17,7 @@ import vllm.models.qwen4_exp.common.ngram_embedding as ngram_embedding_module
 from tests.v1.attention.utils import BatchSpec, create_common_attn_metadata
 from vllm.config import SpeculativeConfig, VllmConfig
 from vllm.config.compilation import CUDAGraphMode
+from vllm.config.engram import EngramConfig
 from vllm.config.quantization import QuantizationConfigArgs
 from vllm.model_executor.layers.quantization.fp8 import Fp8Config
 from vllm.model_executor.layers.quantization.modelopt import (
@@ -1031,7 +1032,7 @@ def test_ngram_prefetch_ids_outlive_start_prefetch() -> None:
     prefetched: list[torch.Tensor] = []
     module.ngram_embedding = SimpleNamespace(
         supports_prefetch=True,
-        start_prefetch=lambda _, ids: prefetched.append(weak_ref_tensor(ids)),
+        start_prefetch=lambda _, ids, **__: prefetched.append(weak_ref_tensor(ids)),
     )
     expected = _reference_ngram_ids(input_ids, query_start_loc, ngram_context, **params)
 
@@ -1903,7 +1904,7 @@ def _build_amd_ngram_embedding(
     monkeypatch.setattr(
         amd_ple_layer,
         "get_current_vllm_config",
-        lambda: SimpleNamespace(engram_config=SimpleNamespace(cpu_offload=cpu_offload)),
+        lambda: SimpleNamespace(engram_config=EngramConfig(cpu_offload=cpu_offload)),
     )
     config = Qwen4ExpTextConfig(
         ngram_size=3,

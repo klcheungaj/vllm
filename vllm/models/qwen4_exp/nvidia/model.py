@@ -75,9 +75,11 @@ from vllm.transformers_utils.configs.qwen4_exp import (
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.kv_cache_interface import MambaSpec
 
+from ..common.ple_disk import is_ple_shard_checkpoint_weight
 from ..config import ATTENTION_LAYER_TYPES, QSA_LAYER_TYPE, Qwen4ExpConfig
 from .hyperconnection import GatedResidual, HyperConnectionConfig
 from .low_latency_gemm import enable_qwen4_exp_low_latency_gemm
+from .ngram_embedding import open_ple_disk_sources
 from .ops.cute_dsl.hc_down_silu import request_hc_down_silu_warmup
 from .ple_layer import Qwen4ExpPLELayer
 from .qsa import Qwen4ExpQSAAttention
@@ -415,6 +417,14 @@ class Qwen4ExpModel(nn.Module):
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers, get_layer, prefix=f"{prefix}.layers"
         )
+        # Disk reads have no compute to overlap within the forward pass, so
+        # they are all queued before the first layer.
+        self._forward_start_prefetch_layers = tuple(
+            layer_idx
+            for layer_idx in range(self.start_layer, self.end_layer)
+            if (ple := getattr(self.layers[layer_idx], "ple", None)) is not None
+            and ple.ple_embedding.ngram_embedding.prefetch_at_forward_start
+        )
         self.is_fused_shared_expert_enabled = is_model_fused_shared_expert_compatible(
             self.layers,
             Qwen4ExpSparseMoeBlock,
@@ -469,7 +479,7 @@ class Qwen4ExpModel(nn.Module):
     @staticmethod
     def _start_layer_ple_prefetch(
         layer: nn.Module,
-        hidden_states: torch.Tensor,
+        hidden_states: torch.Tensor | None,
         input_ids: torch.Tensor | None,
         query_start_loc: torch.Tensor | None,
         ngram_context: torch.Tensor | None,
@@ -497,6 +507,14 @@ class Qwen4ExpModel(nn.Module):
         ngram_context: torch.Tensor | None = None,
         deepstack_input_embeds: IntermediateTensors | None = None,
     ) -> torch.Tensor | IntermediateTensors:
+        for layer_idx in self._forward_start_prefetch_layers:
+            self._start_layer_ple_prefetch(
+                self.layers[layer_idx],
+                None,
+                input_ids,
+                query_start_loc,
+                ngram_context,
+            )
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
@@ -513,7 +531,10 @@ class Qwen4ExpModel(nn.Module):
         block_output = None
         injection = None
         last_layer = None
-        if self.start_layer < self.end_layer:
+        if (
+            self.start_layer < self.end_layer
+            and self.start_layer not in self._forward_start_prefetch_layers
+        ):
             self._start_layer_ple_prefetch(
                 self.layers[self.start_layer],
                 hidden_states,
@@ -525,7 +546,10 @@ class Qwen4ExpModel(nn.Module):
             enumerate(self.layers), self.start_layer, self.end_layer
         ):
             last_layer = layer
-            if layer_idx + 1 < self.end_layer:
+            if (
+                layer_idx + 1 < self.end_layer
+                and layer_idx + 1 not in self._forward_start_prefetch_layers
+            ):
                 self._start_layer_ple_prefetch(
                     self.layers[layer_idx + 1],
                     hidden_states,
@@ -687,6 +711,14 @@ class Qwen4ExpForCausalLM(
         )
         self.set_moe_parameters(self.model.layers)
         enable_qwen4_exp_low_latency_gemm(self, self.model_config.dtype)
+        engram_config = vllm_config.engram_config
+        self.ple_disk_offload = bool(
+            engram_config is not None
+            and engram_config.disk_offload
+            and config.ple_layer_ids
+        )
+        # A wrapping model opens the disk sources once all of its weights load.
+        self.open_ple_disk_sources_after_load = True
         if self.model_config.dtype == torch.bfloat16:
             # Precompile the fused HC down+SiLU kernels for every CUDA-graph
             # capture size in the fused dispatch range, so no CuTe-DSL JIT
@@ -862,6 +894,14 @@ class Qwen4ExpForCausalLM(
         positions = torch.arange(len(input_tokens), dtype=torch.long)
         return positions.unsqueeze(0).expand(3, -1), 0
 
+    def should_skip_checkpoint_weight(self, name: str) -> bool:
+        """Leave disk-offloaded PLE rows unread at load time."""
+        return self.ple_disk_offload and is_ple_shard_checkpoint_weight(name)
+
+    def open_ple_disk_sources(self) -> None:
+        if self.ple_disk_offload:
+            open_ple_disk_sources(self, self.vllm_config)
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         mapper = self.hf_to_vllm_mapper | WeightsMapper(
             orig_to_new_substr={"mtp.": None}
@@ -870,7 +910,10 @@ class Qwen4ExpForCausalLM(
             self,
             ignore_unexpected_suffixes=_QWEN4_EXP_IGNORED_MISSING_SUFFIXES.copy(),
         )
-        return loader.load_weights(weights, mapper=mapper)
+        loaded = loader.load_weights(weights, mapper=mapper)
+        if self.open_ple_disk_sources_after_load:
+            self.open_ple_disk_sources()
+        return loaded
 
 
 class Qwen4ExpProcessingInfo(Qwen3VLProcessingInfo):
@@ -970,6 +1013,9 @@ class Qwen4ExpForConditionalGeneration(
                 vllm_config=vllm_config,
                 prefix=maybe_prefix(prefix, "language_model"),
             )
+        # The weight loader may enter language_model.load_weights once per
+        # contiguous run of its checkpoint names.
+        self.language_model.open_ple_disk_sources_after_load = False
 
         self.make_empty_intermediate_tensors = (
             self.language_model.make_empty_intermediate_tensors
@@ -1065,7 +1111,13 @@ class Qwen4ExpForConditionalGeneration(
             self,
             ignore_unexpected_suffixes=_QWEN4_EXP_IGNORED_MISSING_SUFFIXES.copy(),
         )
-        return loader.load_weights(weights, mapper=mapper)
+        loaded = loader.load_weights(weights, mapper=mapper)
+        self.language_model.open_ple_disk_sources()
+        return loaded
+
+    def should_skip_checkpoint_weight(self, name: str) -> bool:
+        """Leave disk-offloaded PLE rows unread at load time."""
+        return self.language_model.should_skip_checkpoint_weight(name)
 
     @classmethod
     def get_mamba_state_dtype_from_config(

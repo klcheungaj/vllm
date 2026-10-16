@@ -83,10 +83,8 @@ directly from the Triton kernel through unified virtual addressing (UVA),
 prefetching on a side CUDA stream so transfers overlap with the compute of
 preceding layers. The freed GPU memory goes to the KV cache.
 
-`cpu_offload` defaults to `true` (on): it follows the
-`VLLM_PLE_CPU_OFFLOAD` environment variable, which also defaults to `true`.
-An explicit `--engram-config` value takes precedence over the environment
-variable.
+`cpu_offload` defaults to `true` (on) and is set with
+`--engram-config.cpu_offload`.
 
 To keep the tables resident on GPU instead (e.g. when host memory is
 scarce):
@@ -96,8 +94,52 @@ vllm serve deepseek-ai/DeepSeek-V4.1-Flash \
   --engram-config.cpu_offload false
 ```
 
-or equivalently `VLLM_PLE_CPU_OFFLOAD=0`. CPU offload requires a GPU with UVA
-support; vLLM fails fast when it is unavailable.
+CPU offload requires a GPU with UVA support; vLLM fails fast when it is
+unavailable.
+
+## Disk offload (Qwen4Exp)
+
+On unified-memory systems such as DGX Spark, pinned host memory and GPU
+memory are the same physical pool, so `cpu_offload` saves nothing. With
+`disk_offload`, vLLM never loads the PLE table: it skips the table shards at
+load time and reads the rows each step needs straight from the checkpoint
+safetensors files on the NVMe drive, into a pinned staging buffer that the
+GPU reads through UVA. Reads are issued by CUDA-graph-capturable host nodes,
+so disk offload works in eager mode and with piecewise, breakable, and full
+CUDA graphs.
+
+```bash
+vllm serve <qwen4exp-checkpoint> \
+  --engram-config.disk_offload true \
+  --engram-config.disk_row_cache_rows 4194304
+```
+
+`disk_offload` takes precedence over `cpu_offload`. Its tuning knobs are:
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `disk_row_cache_rows` | `1048576` | Rows kept in a host-memory row cache; `0` disables it. |
+| `disk_io_threads` | `16` | I/O worker threads. |
+| `disk_max_inflight` | `256` | Maximum outstanding row reads. |
+| `disk_direct_io` | `true` | Read with `O_DIRECT`, falling back to buffered reads where the filesystem does not support it. |
+| `disk_prefetch_hints` | `true` | Prefetch the rows of upcoming prefill chunks while earlier steps run. |
+| `disk_wait_timeout_s` | `60.0` | Seconds a step waits for its reads before failing. |
+
+Only `disk_offload` itself affects the compilation cache; the knobs can be
+retuned without recompiling.
+
+In containers, bind-mount the model directory from a real filesystem (for
+example `-v /models:/models`) rather than reading it through an overlay
+filesystem, which may not support `O_DIRECT`. No `--privileged` flag is
+needed. The row reader is a small C++ extension compiled on first use, so the
+image needs a C++ compiler and `ninja`; mount `TORCH_EXTENSIONS_DIR` on a
+persistent volume to skip the rebuild on container restarts. NVMe autonomous power-state transitions can add millisecond wake-up
+latency to sparse reads; if per-step latency is spiky, disable them on the
+host with the kernel parameter `nvme_core.default_ps_max_latency_us=0`.
+
+Disk offload requires CUDA (the ROCm Qwen4Exp implementation does not support
+it) with tensor, data, and pipeline parallel sizes of 1, and is incompatible
+with `dp_shared_memory` and `use_thp`.
 
 ## Data-parallel topologies (DeepSeek V4.1)
 
@@ -118,7 +160,8 @@ vllm serve deepseek-ai/DeepSeek-V4.1-Flash \
 ```
 
 `embedding_across_dp` is not supported with elastic expert parallelism yet.
-Qwen4Exp PLE tables are ETP-sharded instead and honor `cpu_offload` only.
+Qwen4Exp PLE tables are ETP-sharded instead and honor only `cpu_offload` and
+`disk_offload`.
 
 ## Sharing host tables across DP replicas
 
@@ -146,3 +189,5 @@ IPC namespace across the co-located replicas.
   `--enable-dbo` and set `--ubatch-size 0`.
 - `dp_shared_memory` requires `cpu_offload`, `data_parallel_size > 1`, and is
   unsupported with elastic expert parallelism.
+- `disk_offload` is Qwen4Exp-only and requires CUDA with TP, DP, and PP sizes
+  of 1.

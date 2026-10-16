@@ -6,7 +6,7 @@ import dataclasses
 import glob
 import os
 import time
-from collections.abc import Generator, Iterable
+from collections.abc import Callable, Generator, Iterable
 from typing import TYPE_CHECKING, cast
 
 import torch
@@ -252,9 +252,19 @@ class DefaultModelLoader(BaseModelLoader):
         return hf_folder, hf_weights_files, use_safetensors, index_file
 
     def _get_weights_iterator(
-        self, source: Source
+        self,
+        source: Source,
+        skip_weight_fn: Callable[[str], bool] | None = None,
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
-        """Get an iterator for the model weights based on the load format."""
+        """Get an iterator for the model weights based on the load format.
+
+        Args:
+            source: The checkpoint to read.
+            skip_weight_fn: Optional predicate on prefixed checkpoint names;
+                matching weights are dropped, and the lazy safetensors path
+                never reads them.
+
+        """
         extra_config = self.load_config.model_loader_extra_config
         hf_folder, hf_weights_files, use_safetensors, index_file = (
             self._prepare_weights(
@@ -325,6 +335,11 @@ class DefaultModelLoader(BaseModelLoader):
                         safetensors_prefetch_block_size=(
                             self.load_config.safetensors_prefetch_block_size
                         ),
+                        skip_weight_fn=(
+                            None
+                            if skip_weight_fn is None
+                            else lambda name: skip_weight_fn(source.prefix + name)
+                        ),
                     )
         else:
             if extra_config.get("enable_multithread_load"):
@@ -346,7 +361,10 @@ class DefaultModelLoader(BaseModelLoader):
         if self.counter_before_loading_weights == 0.0:
             self.counter_before_loading_weights = time.perf_counter()
         # Apply the prefix.
-        return ((source.prefix + name, tensor) for (name, tensor) in weights_iterator)
+        prefixed = ((source.prefix + name, tensor) for name, tensor in weights_iterator)
+        if skip_weight_fn is None:
+            return prefixed
+        return (item for item in prefixed if not skip_weight_fn(item[0]))
 
     def get_all_weights(
         self,
@@ -360,14 +378,15 @@ class DefaultModelLoader(BaseModelLoader):
             fall_back_to_pt=getattr(model, "fall_back_to_pt_during_load", True),
             allow_patterns_overrides=getattr(model, "allow_patterns_overrides", None),
         )
-        yield from self._get_weights_iterator(primary_weights)
+        skip_weight_fn = getattr(model, "should_skip_checkpoint_weight", None)
+        yield from self._get_weights_iterator(primary_weights, skip_weight_fn)
 
         secondary_weights = cast(
             Iterable[DefaultModelLoader.Source],
             getattr(model, "secondary_weights", ()),
         )
         for source in secondary_weights:
-            yield from self._get_weights_iterator(source)
+            yield from self._get_weights_iterator(source, skip_weight_fn)
 
     def download_model(self, model_config: ModelConfig) -> None:
         self._prepare_weights(
