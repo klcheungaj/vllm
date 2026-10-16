@@ -174,9 +174,13 @@ steps:
   - vllm/transformers_utils/configs/qwen4_exp.py
   - vllm/config/compilation.py
   - vllm/v1/attention/backends/short_conv_attn.py
+  - vllm/config/engram.py
+  - vllm/model_executor/model_loader/
   - tests/models/qwen4_exp/
   commands:
     - pytest -v -s models/qwen4_exp/test_hc_ops.py models/qwen4_exp/test_qsa_pre_indexer.py models/qwen4_exp/test_qsa_reference.py
+    # PLE and QSA import conflicting HC registrations in a shared process.
+    - pytest -v -s models/qwen4_exp/test_ple_disk_reader.py
   mirror:
     amd:
       label: ":amd: (MI355 DPX) Qwen4 Exp"
