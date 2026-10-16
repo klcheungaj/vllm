@@ -1736,6 +1736,7 @@ def test_engram_disk_tunables_keep_compile_hash():
         disk_direct_io=False,
         disk_prefetch_hints=False,
         disk_wait_timeout_s=1.0,
+        disk_stats_interval_s=0.0,
     )
     assert tuned.compute_hash() == EngramConfig(disk_offload=True).compute_hash()
 
@@ -1749,6 +1750,7 @@ def test_engram_disk_tunables_keep_compile_hash():
         {"disk_io_threads": 0},
         {"disk_max_inflight": 0},
         {"disk_wait_timeout_s": 0.0},
+        {"disk_stats_interval_s": -1.0},
     ],
 )
 def test_engram_disk_offload_rejects_invalid_options(options):

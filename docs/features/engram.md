@@ -124,6 +124,12 @@ vllm serve <qwen4exp-checkpoint> \
 | `disk_direct_io` | `true` | Read with `O_DIRECT`, falling back to buffered reads where the filesystem does not support it. |
 | `disk_prefetch_hints` | `true` | Prefetch the rows of upcoming prefill chunks while earlier steps run. |
 | `disk_wait_timeout_s` | `60.0` | Seconds a step waits for its reads before failing. |
+| `disk_stats_interval_s` | `60.0` | Seconds between reader statistics log lines; `0` disables them. |
+
+To size `disk_row_cache_rows`, watch the periodic `PLE disk ...` log line: it
+reports the row-cache hit rate, SSD reads, read latency, and the average time
+each step waited for its rows. Raise the cache until the wait stops shrinking;
+each million rows costs about 160 MB of host memory for an FP8 table.
 
 Only `disk_offload` itself affects the compilation cache; the knobs can be
 retuned without recompiling.

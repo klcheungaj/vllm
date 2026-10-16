@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Model-runner state for Qwen4Exp PLE inputs."""
 
+import time
 from typing import Any
 
 import numpy as np
@@ -47,6 +48,12 @@ class Qwen4ExpModelState(MambaHybridModelState):
         self.ple_disk_layers: list[tuple[Qwen4ExpPLEDiskEmbedding, dict[str, Any]]]
         self.ple_disk_layers = []
         self.ple_disk_layers_resolved = False
+        self.ple_disk_stats_interval_s = (
+            engram_config.disk_stats_interval_s
+            if engram_config is not None and self.ple_disk_offload
+            else 0.0
+        )
+        self.ple_disk_stats_logged_at = time.monotonic()
         self.prefill_token_ids: dict[str, np.ndarray] = {}
         if not self.uses_ngram_embedding:
             self.ngram_context_len = 0
@@ -131,6 +138,12 @@ class Qwen4ExpModelState(MambaHybridModelState):
         layers = self._get_ple_disk_layers()
         for embedding, _ in layers:
             embedding.check_error()
+        now = time.monotonic()
+        elapsed = now - self.ple_disk_stats_logged_at
+        if 0 < self.ple_disk_stats_interval_s <= elapsed:
+            self.ple_disk_stats_logged_at = now
+            for embedding, _ in layers:
+                embedding.log_and_reset_stats(elapsed)
         if not self.ple_disk_hints:
             return
         num_reqs = input_batch.num_reqs

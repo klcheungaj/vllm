@@ -372,6 +372,31 @@ class Qwen4ExpPLEDiskEmbedding(Qwen4ExpPLEEmbedding):
         if self.reader is not None:
             self.reader.check_error()
 
+    def log_and_reset_stats(self, interval_s: float) -> None:
+        """Log the reader statistics gathered since the previous call."""
+        if self.reader is None:
+            return
+        stats = self.reader.stats()
+        self.reader.reset_stats()
+        requests = int(stats["requests"])
+        jobs = max(1, int(stats["demand_jobs"]))
+        logger.info(
+            "PLE disk %s over %.0fs: %d rows requested, %.1f%% row-cache hits, "
+            "%d SSD reads (%.1f MB), read p50 %.0f us p99 %.0f us, "
+            "%.0f us average wait per step, %d hinted rows (%d dropped)",
+            self.prefix,
+            interval_s,
+            requests,
+            100.0 * int(stats["cache_hits"]) / max(1, requests),
+            int(stats["reads"]),
+            int(stats["bytes"]) / 1e6,
+            stats["read_us_p50"],
+            stats["read_us_p99"],
+            float(stats["demand_wait_us"]) / jobs,
+            int(stats["hint_rows"]),
+            int(stats["hint_dropped"]),
+        )
+
     def start_prefetch(
         self,
         hidden_states: torch.Tensor | None,

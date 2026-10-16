@@ -182,6 +182,8 @@ def test_prefill_hints_cover_this_and_next_chunk():
     state.ple_disk_hints = True
     state.ple_disk_layers = [(embedding, params)]
     state.ple_disk_layers_resolved = True
+    state.ple_disk_stats_interval_s = 0.0
+    state.ple_disk_stats_logged_at = 0.0
     tokens = np.arange(100, 140, dtype=np.int64)
     state.prefill_token_ids = {"prefill": tokens, "decode": tokens}
     batch = SimpleNamespace(
@@ -315,6 +317,9 @@ def test_disk_embedding_reads_checkpoint_rows(tmp_path, single_rank, fp8):
     scale = 0.5 if fp8 else 1.0
     assert torch.equal(dequantized.cpu(), expected.to(torch.bfloat16) * scale)
     embedding.check_error()
+    assert embedding.reader.stats()["requests"] == num_tokens * _NUM_HEADS
+    embedding.log_and_reset_stats(1.0)
+    assert embedding.reader.stats()["requests"] == 0
 
 
 @requires_uva

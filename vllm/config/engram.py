@@ -31,6 +31,7 @@ _DISK_TUNABLE_FIELDS = frozenset(
         "disk_direct_io",
         "disk_prefetch_hints",
         "disk_wait_timeout_s",
+        "disk_stats_interval_s",
     }
 )
 
@@ -93,6 +94,10 @@ class EngramConfig:
 
     disk_wait_timeout_s: float = Field(default=60.0, gt=0)
     """Seconds a step waits for its disk offload reads before failing."""
+
+    disk_stats_interval_s: float = Field(default=60.0, ge=0)
+    """Seconds between disk offload reader statistics log lines (row-cache
+    hit rate, SSD reads, read latency, per-step wait); 0 disables them."""
 
     @model_validator(mode="after")
     def _validate_shared_memory(self) -> Self:
