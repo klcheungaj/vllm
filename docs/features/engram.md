@@ -426,11 +426,17 @@ docker run --gpus all --ipc=host --network host \
 The `PLE offload` GitHub workflow (`.github/workflows/ple-offload.yml`)
 runs the PLE tests on a CPU runner (the remote reader over UCX's tcp
 transport), builds and smoke-tests the memory server image, and builds the
-Spark image's UCX stage on a hosted arm64 runner. Building the whole Spark
-image and running the GPU tests in it needs a self-hosted runner on a DGX
-Spark: set the repository variable `DGX_SPARK_RUNNER` to its labels as a
-JSON list, e.g. `["self-hosted", "linux", "ARM64", "dgx-spark"]`. Pull
-requests from forks never run on it.
+Spark image on GitHub's hosted arm64 runner. That runner cannot compile
+vLLM's kernels in time, so the Spark image takes them from the upstream
+wheel built for the commit the branch is based on
+(`DGX_SPARK_USE_PRECOMPILED=1` and `VLLM_MERGE_BASE_COMMIT` in the bake
+file), which is only valid while the branch does not change them; it has no
+GPU, so the GPU tests do not run. To build on a DGX Spark instead, compiling
+the kernels and running the PLE tests on its GPU, register it as a
+self-hosted runner and set the repository variable `DGX_SPARK_RUNNER` to its
+labels as a JSON list, e.g. `["self-hosted", "linux", "ARM64",
+"dgx-spark"]` (set `DGX_SPARK_USE_PRECOMPILED` to `1` to skip compiling
+there too). Pull requests from forks never run this job.
 
 Outside pull requests, the workflow pushes the tested images to GitHub
 Container Registry as `ghcr.io/<owner>/vllm-ple-mem-server` and

@@ -163,17 +163,32 @@ variable "DGX_SPARK_NVCC_THREADS" {
   default = 2
 }
 
+# 1 takes vLLM's compiled kernels from the upstream wheel built for
+# VLLM_MERGE_BASE_COMMIT (the upstream commit this branch is based on)
+# instead of compiling them; only valid while the branch does not change
+# them.
+variable "DGX_SPARK_USE_PRECOMPILED" {
+  default = ""
+}
+
+variable "VLLM_MERGE_BASE_COMMIT" {
+  default = ""
+}
+
 target "openai-dgx-spark-base" {
   inherits  = ["_common", "_labels"]
   target    = "vllm-openai"
   platforms = ["linux/arm64"]
   tags      = ["vllm:openai-dgx-spark-base"]
   args = {
-    BUILD_BASE_IMAGE     = DGX_SPARK_BUILD_BASE_IMAGE
-    CUDA_VERSION         = DGX_SPARK_CUDA_VERSION
-    torch_cuda_arch_list = DGX_SPARK_CUDA_ARCH_LIST
-    max_jobs             = DGX_SPARK_MAX_JOBS
-    nvcc_threads         = DGX_SPARK_NVCC_THREADS
+    BUILD_BASE_IMAGE       = DGX_SPARK_BUILD_BASE_IMAGE
+    CUDA_VERSION           = DGX_SPARK_CUDA_VERSION
+    torch_cuda_arch_list   = DGX_SPARK_CUDA_ARCH_LIST
+    max_jobs               = DGX_SPARK_MAX_JOBS
+    nvcc_threads           = DGX_SPARK_NVCC_THREADS
+    VLLM_USE_PRECOMPILED   = DGX_SPARK_USE_PRECOMPILED
+    VLLM_MERGE_BASE_COMMIT = VLLM_MERGE_BASE_COMMIT
+    VLLM_MAIN_CUDA_VERSION = join(".", slice(split(".", DGX_SPARK_CUDA_VERSION), 0, 2))
   }
 }
 
