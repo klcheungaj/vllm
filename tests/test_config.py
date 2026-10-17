@@ -1738,6 +1738,7 @@ def test_engram_disk_tunables_keep_compile_hash():
         disk_wait_timeout_s=1.0,
         disk_stats_interval_s=0.0,
         remote_memory_server="10.0.0.2:18515",
+        remote_memory_backend="ucx",
         remote_max_inflight=8,
         remote_region_bytes=1 << 20,
         remote_upload_chunk_bytes=1 << 20,
@@ -1761,6 +1762,7 @@ def test_engram_disk_tunables_keep_compile_hash():
         {"remote_region_bytes": (1 << 20) - 1},
         {"remote_upload_chunk_bytes": (1 << 20) - 1},
         {"remote_connect_timeout_s": 0.0},
+        {"remote_memory_backend": "loopback"},
     ],
 )
 def test_engram_disk_offload_rejects_invalid_options(options):

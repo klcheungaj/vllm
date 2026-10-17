@@ -5,6 +5,7 @@
 import json
 from itertools import accumulate
 from types import SimpleNamespace
+from typing import get_args
 
 import numpy as np
 import pytest
@@ -413,6 +414,14 @@ def remote_embedding(tmp_path, single_rank, monkeypatch):
     monkeypatch.setattr(reader_module, "PLEDiskReader", _FakeRemoteReader)
     embedding, _ = _make_disk_embedding(tmp_path, fp8=False)
     return embedding
+
+
+def test_config_backends_match_reader_backends():
+    """Every configurable backend must have a reader variant to build."""
+    from vllm.config.engram import RemoteMemoryBackend
+    from vllm.models.qwen4_exp.common.ple_disk_reader import REMOTE_BACKENDS
+
+    assert set(get_args(RemoteMemoryBackend)) == set(REMOTE_BACKENDS)
 
 
 @requires_uva

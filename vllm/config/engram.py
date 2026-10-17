@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 import regex as re
 from pydantic import Field, model_validator
@@ -33,6 +33,7 @@ _DISK_TUNABLE_FIELDS = frozenset(
         "disk_prefetch_hints",
         "disk_wait_timeout_s",
         "disk_stats_interval_s",
+        "remote_memory_backend",
         "remote_memory_server",
         "remote_max_inflight",
         "remote_region_bytes",
@@ -44,21 +45,21 @@ _DISK_TUNABLE_FIELDS = frozenset(
 _HOST_PORT_RE = re.compile(r"\[([^\[\]\s]+)\]:(\d{1,5})|([^:\[\]\s]+):(\d{1,5})")
 
 
-def _parse_host_port(address: str) -> tuple[str, int]:
-    """Split a ``host:port`` or ``[ipv6]:port`` address.
+RemoteMemoryBackend = Literal["ucx"]
 
-    Raises:
-        ValueError: If the address is malformed or the port is out of range.
 
-    """
+def _check_host_port(backend: str, address: str) -> None:
     match = _HOST_PORT_RE.fullmatch(address)
     port = int(match[2] or match[4]) if match else 0
     if match is None or not 1 <= port <= 65535:
         raise ValueError(
-            "remote_memory_server must be 'host:port' or '[ipv6]:port' with a "
-            f"port in 1..65535, got {address!r}"
+            f"remote_memory_server for the {backend} backend must be 'host:port' "
+            f"or '[ipv6]:port' with a port in 1..65535, got {address!r}"
         )
-    return match[1] or match[3], port
+
+
+# Backend -> validator of its remote_memory_server address.
+_REMOTE_ADDRESS_CHECKS = {"ucx": _check_host_port}
 
 
 def model_has_engram_layers(model_config: "ModelConfig | None") -> bool:
@@ -125,10 +126,14 @@ class EngramConfig:
     hit rate, SSD reads, read latency, per-step wait); 0 disables them."""
 
     remote_memory_server: str | None = None
-    """Address ("host:port" or "[ipv6]:port") of a PLE memory server to
-    borrow RAM from over UCX. The table is uploaded there from the checkpoint
-    in the background and rows are then read with one-sided RDMA instead of
-    from the SSD. Requires disk_offload."""
+    """Address of a memory server to borrow RAM from, in the form the
+    remote_memory_backend expects ("host:port" or "[ipv6]:port" for ucx). The
+    table is uploaded there from the checkpoint in the background and rows are
+    then read remotely instead of from the SSD. Requires disk_offload."""
+
+    remote_memory_backend: RemoteMemoryBackend = "ucx"
+    """Transport used to reach remote_memory_server: "ucx" (RDMA such as
+    RoCEv2 or InfiniBand, or TCP, through UCX)."""
 
     remote_max_inflight: int = Field(default=256, ge=1)
     """Maximum outstanding row reads from the remote memory server."""
@@ -163,7 +168,9 @@ class EngramConfig:
         if self.remote_memory_server is not None:
             if not self.disk_offload:
                 raise ValueError("remote_memory_server requires disk_offload=True")
-            _parse_host_port(self.remote_memory_server)
+            _REMOTE_ADDRESS_CHECKS[self.remote_memory_backend](
+                self.remote_memory_backend, self.remote_memory_server
+            )
         return self
 
     def verify_model_config(self, model_config: "ModelConfig | None") -> None:

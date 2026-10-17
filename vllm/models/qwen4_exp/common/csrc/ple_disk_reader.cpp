@@ -10,10 +10,12 @@
 // pinned buffers, which makes the path CUDA-graph capturable. Hints prefetch
 // into the cache at low priority.
 //
-// Built with -DPLE_WITH_UCX, the table can also be uploaded to RAM borrowed
-// from a PLE memory server (../ple_mem_server/) and read back with one-sided
-// UCX GETs; the SSD stays the source for rows not uploaded yet and the
-// fallback when the server fails.
+// Built with remote memory backends (-DPLE_WITH_UCX, -DPLE_WITH_LOOPBACK for
+// in-process tests; any subset), the table can also be uploaded to RAM
+// borrowed from a memory server and read back with one-row GETs
+// (ple_remote_source.h); the SSD stays the source for rows not uploaded yet
+// and the fallback when the server fails. The backend is chosen by name once,
+// when the reader starts.
 //
 // No CUDA headers: `cuLaunchHostFunc` is resolved from libcuda at runtime.
 
@@ -44,12 +46,13 @@
 #include <utility>
 #include <vector>
 
-#ifdef PLE_WITH_UCX
-  #include <netdb.h>
-  #include <ucp/api/ucp.h>
+#include "ple_remote_source.h"
 
-  #include "../ple_mem_server/ple_mem_protocol.h"
-  #include "../ple_mem_server/ple_mem_util.h"
+#ifdef PLE_WITH_UCX
+  #include "ple_ucx_transport.h"
+#endif
+#ifdef PLE_WITH_LOOPBACK
+  #include "ple_loopback_transport.h"
 #endif
 
 namespace py = pybind11;
@@ -65,13 +68,7 @@ constexpr size_t kCacheStripes = 1024;
 constexpr size_t kHintInboxRows = size_t{1} << 20;
 constexpr size_t kHintQueueReads = size_t{1} << 16;
 
-double now_us() {
-  using namespace std::chrono;
-  return static_cast<double>(
-             duration_cast<nanoseconds>(steady_clock::now().time_since_epoch())
-                 .count()) /
-         1000.0;
-}
+using ple_remote::now_us;
 
 // 8-way set-associative row cache with CLOCK (second chance) replacement:
 // a hit marks the way referenced, an insert sweeps the set's hand clearing
@@ -228,33 +225,6 @@ struct LatencyRing {
   }
 };
 
-enum class RemoteState { kDisabled, kConnecting, kUploading, kReady, kFailed };
-
-const char* remote_state_name(RemoteState s) {
-  switch (s) {
-    case RemoteState::kDisabled:
-      return "disabled";
-    case RemoteState::kConnecting:
-      return "connecting";
-    case RemoteState::kUploading:
-      return "uploading";
-    case RemoteState::kReady:
-      return "ready";
-    case RemoteState::kFailed:
-      return "failed";
-  }
-  return "unknown";
-}
-
-struct RemoteParams {
-  std::string server;
-  uint32_t max_inflight = 0;
-  uint64_t region_rows = 0;
-  uint64_t chunk_rows = 0;
-  double connect_timeout_s = 0;
-  bool fallback_to_disk = true;
-};
-
 using LaunchHostFunc = int (*)(void*, void (*)(void*), void*);
 
 LaunchHostFunc get_launch_host_func() {
@@ -267,79 +237,14 @@ LaunchHostFunc get_launch_host_func() {
   return fn;
 }
 
-#ifdef PLE_WITH_UCX
-constexpr uint32_t kUploadBuffers = 4;
+class Core;
 
-struct RemoteRegion {
-  uint64_t id = 0;
-  uint64_t addr = 0;
-  uint64_t bytes = 0;
-  ucp_rkey_h rkey = nullptr;
-};
+using RemoteFactory = std::unique_ptr<ple_remote::RemoteSourceBase> (*)(
+    Core&, ple_remote::Layout, bool);
 
-struct Ucx;
-
-struct GetOp {
-  Ucx* ucx = nullptr;
-  uint32_t slot = 0;
-  ReadPtr read;
-  double t0 = 0;
-  ucs_status_t status = UCS_OK;
-};
-
-// Puts of one staged upload chunk plus the flush making them visible.
-struct ChunkOp {
-  Ucx* ucx = nullptr;
-  uint32_t buf = 0;
-  uint64_t seq = 0;
-  uint64_t row_end = 0;
-  uint64_t bytes = 0;
-  int outstanding = 0;
-  ucs_status_t status = UCS_OK;
-};
-
-struct AmSend {
-  void* request;
-  std::vector<char> payload;
-};
-
-// State owned by the UCX thread.
-struct Ucx {
-  ucp_context_h ctx = nullptr;
-  ucp_worker_h worker = nullptr;
-  ucp_ep_h ep = nullptr;
-  bool ep_failed = false;
-  ucs_status_t ep_status = UCS_OK;
-  std::vector<RemoteRegion> regions;
-  std::vector<std::vector<char>> replies;
-  std::vector<AmSend> sends;
-
-  uint8_t* get_slab = nullptr;
-  ucp_mem_h get_memh = nullptr;
-  std::vector<GetOp> gets;
-  std::vector<uint32_t> get_free;
-  std::vector<uint32_t> get_done;
-
-  std::vector<uint8_t*> stage;
-  std::vector<ucp_mem_h> stage_memh;
-  std::vector<ChunkOp> chunks;
-  std::vector<uint32_t> chunk_done;
-  std::map<uint64_t, std::pair<uint64_t, uint64_t>> visible;
-  uint64_t next_seq = 0;
-
-  uint64_t outstanding = 0;
-  uint64_t seen_kick = 0;
-  bool backlog = false;
-};
-
-struct UploadChunk {
-  uint64_t seq;
-  uint32_t buf;
-  uint32_t shift;
-  uint64_t row;
-  uint64_t rows;
-};
-#endif
+// Factory of the compiled-in backend `name`, or null.
+RemoteFactory find_remote_backend(const std::string& name);
+std::vector<std::string> remote_backend_names();
 
 class Core {
  public:
@@ -350,9 +255,9 @@ class Core {
        const std::vector<int64_t>& seg_num_rows, int64_t row_bytes,
        int64_t cache_rows, int64_t io_threads, int64_t max_inflight,
        bool direct_io, double wait_timeout_s, const std::string& remote_server,
-       int64_t remote_max_inflight, int64_t remote_region_bytes,
-       int64_t remote_upload_chunk_bytes, double remote_connect_timeout_s,
-       bool remote_fallback_to_disk)
+       const std::string& remote_backend, int64_t remote_max_inflight,
+       int64_t remote_region_bytes, int64_t remote_upload_chunk_bytes,
+       double remote_connect_timeout_s, bool remote_fallback_to_disk)
       : rb_(static_cast<uint32_t>(row_bytes)),
         timeout_us_(wait_timeout_s * 1e6) {
     if (row_bytes <= 0 || row_bytes > static_cast<int64_t>(kPage))
@@ -363,23 +268,30 @@ class Core {
     if (wait_timeout_s <= 0)
       throw std::invalid_argument("wait_timeout_s must be > 0");
     if (!remote_server.empty()) {
-#ifndef PLE_WITH_UCX
-      throw std::invalid_argument(
-          "remote_server needs the reader built with UCX support");
-#endif
+      remote_make_ = find_remote_backend(remote_backend);
+      if (remote_make_ == nullptr) {
+        std::string names;
+        for (const auto& n : remote_backend_names())
+          names += (names.empty() ? "" : ", ") + n;
+        throw std::invalid_argument(
+            "PLE remote memory backend '" + remote_backend +
+            "' is not compiled into this reader (compiled in: " +
+            (names.empty() ? "none" : names) + ")");
+      }
       if (remote_max_inflight <= 0 || remote_region_bytes <= 0 ||
           remote_upload_chunk_bytes <= 0 || remote_connect_timeout_s <= 0)
         throw std::invalid_argument(
             "remote max_inflight, region_bytes, upload_chunk_bytes and "
             "connect_timeout_s must be > 0");
-      remote_.server = remote_server;
-      remote_.max_inflight = static_cast<uint32_t>(remote_max_inflight);
-      remote_.region_rows =
+      ple_remote::Params& p = remote_.params;
+      p.address = remote_server;
+      p.max_inflight = static_cast<uint32_t>(remote_max_inflight);
+      p.region_rows =
           std::max<uint64_t>(1, uint64_t(remote_region_bytes) / rb_);
-      remote_.chunk_rows =
+      p.chunk_rows =
           std::max<uint64_t>(1, uint64_t(remote_upload_chunk_bytes) / rb_);
-      remote_.connect_timeout_s = remote_connect_timeout_s;
-      remote_.fallback_to_disk = remote_fallback_to_disk;
+      p.connect_timeout_s = remote_connect_timeout_s;
+      p.fallback_to_disk = remote_fallback_to_disk;
     }
     const size_t ns = seg_file.size();
     if (seg_offset.size() != ns || seg_row_start.size() != ns ||
@@ -401,7 +313,7 @@ class Core {
       seg_offset_.push_back(static_cast<uint64_t>(seg_offset[i]));
       seg_start_.push_back(static_cast<uint64_t>(seg_row_start[i]));
       seg_rows_.push_back(static_cast<uint64_t>(seg_num_rows[i]));
-      remote_total_bytes_ += uint64_t(seg_num_rows[i]) * rb_;
+      remote_.total_bytes += uint64_t(seg_num_rows[i]) * rb_;
     }
     paths_ = paths;
     direct_ = direct_io;
@@ -431,9 +343,7 @@ class Core {
     slab_ = static_cast<uint8_t*>(slab);
     for (uint32_t s = slots_; s-- > 0;) free_slots_.push_back(s);
     cache_.init(static_cast<uint64_t>(cache_rows), rb_);
-#ifdef PLE_WITH_UCX
-    if (!remote_.server.empty()) start_remote();
-#endif
+    if (remote_make_ != nullptr) start_remote();
     planner_ = std::thread([this] { planner_loop(); });
     num_workers_ = static_cast<size_t>(io_threads);
     for (int64_t i = 0; i < io_threads; ++i)
@@ -448,19 +358,13 @@ class Core {
       if (closed_) return;
       closed_ = true;
     }
-    stop_remote_.store(true);
     cv_work_.notify_all();
     cv_plan_.notify_all();
-    cv_remote_.notify_all();
-    cv_upload_.notify_all();
+    remote_.cv.notify_all();
     if (planner_.joinable()) planner_.join();
     for (auto& t : workers_) t.join();
     workers_.clear();
-    if (upload_thread_.joinable()) upload_thread_.join();
-    if (ucx_thread_.joinable()) ucx_thread_.join();
-#ifdef PLE_WITH_UCX
-    free_stage_buffers();
-#endif
+    if (remote_src_) remote_src_->stop();
     {
       std::lock_guard<std::mutex> lk(mu_);
       for (auto* q : {&demand_q_, &hint_q_, &rdemand_q_, &rhint_q_}) {
@@ -484,7 +388,7 @@ class Core {
       hint_inbox_.clear();
       inflight_.clear();
       bound_latest_.reset();
-      ready_rows_.store(0);
+      remote_.ready_rows.store(0);
       if (error_.empty()) error_ = "PLE disk reader closed";
     }
     cv_done_.notify_all();
@@ -608,21 +512,21 @@ class Core {
   }
 
   py::dict remote_status() {
-    RemoteState state;
+    ple_remote::State state;
     uint64_t uploaded, regions;
     std::string error;
     {
       std::lock_guard<std::mutex> lk(mu_);
-      state = remote_state_;
-      uploaded = remote_uploaded_bytes_;
-      regions = remote_regions_;
-      error = remote_error_;
+      state = remote_.state;
+      uploaded = remote_.uploaded_bytes;
+      regions = remote_.regions;
+      error = remote_.error;
     }
     py::dict d;
-    d["state"] = remote_state_name(state);
+    d["state"] = ple_remote::state_name(state);
     d["uploaded_bytes"] = uploaded;
     d["total_bytes"] =
-        state == RemoteState::kDisabled ? 0 : remote_total_bytes_;
+        state == ple_remote::State::kDisabled ? 0 : remote_.total_bytes;
     d["regions"] = regions;
     d["error"] = error;
     return d;
@@ -634,6 +538,62 @@ class Core {
   }
 
   bool host_funcs_launched() const { return host_funcs_launched_; }
+
+  // Host interface of the remote source (ple_remote_source.h).
+  using RemoteRead = ReadPtr;
+
+  std::mutex& remote_mutex() { return mu_; }
+  ple_remote::Link& remote_link() { return remote_; }
+  bool closed_locked() const { return closed_; }
+
+  ReadPtr pop_remote_read_locked() {
+    ReadPtr r = pop_read_locked(rdemand_q_, rhint_q_);
+    if (r) r->started = true;
+    return r;
+  }
+
+  bool remote_reads_queued_locked() const {
+    return !rdemand_q_.empty() || !rhint_q_.empty();
+  }
+
+  void complete_remote_read(const ReadPtr& r, const uint8_t* row, double us) {
+    finish_read(r, row, rb_, 0, us, -1);
+  }
+
+  void requeue_remote_reads(const std::vector<ReadPtr>& reads) {
+    size_t queued = 0;
+    bool done = false;
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      for (const auto& r : reads) done |= requeue_remote_locked(r, &queued);
+    }
+    if (done) cv_done_.notify_all();
+    notify_workers(queued);
+  }
+
+  // No new remote reads are planned; queued ones go back to the SSD (or
+  // fail).
+  void fail_remote(const std::string& reason) {
+    size_t queued = 0;
+    bool done = false;
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      if (remote_.state != ple_remote::State::kFailed && !closed_) {
+        remote_.state = ple_remote::State::kFailed;
+        remote_.error = reason;
+        if (!remote_.params.fallback_to_disk)
+          set_error_locked("PLE remote memory failed: " + reason);
+      }
+      remote_.ready_rows.store(0);
+      for (auto* q : {&rdemand_q_, &rhint_q_}) {
+        for (auto& r : *q)
+          if (!r->started) done |= requeue_remote_locked(r, &queued);
+        q->clear();
+      }
+    }
+    if (done) cv_done_.notify_all();
+    notify_workers(queued);
+  }
 
  private:
   static void notify_cb(void* p) {
@@ -742,7 +702,7 @@ class Core {
       }
       ++job->writers;
     }
-    const uint64_t ready = ready_rows_.load(std::memory_order_acquire);
+    const uint64_t ready = remote_.ready_rows.load(std::memory_order_acquire);
     std::vector<Miss> misses;
     uint64_t hits = 0;
     bool any_remote = false;
@@ -788,7 +748,7 @@ class Core {
         }
         return;
       }
-      if (any_remote && !remote_usable_locked()) {
+      if (any_remote && !remote_.usable()) {
         for (auto& m : misses) {
           if (!m.remote) continue;
           size_t seg;
@@ -817,7 +777,7 @@ class Core {
       if (demand && finish_pending(job, 1)) cv_done_.notify_all();
       if (demand && job->writers == 0 && job->cancelled) cv_done_.notify_all();
     }
-    if (queued_remote) cv_remote_.notify_one();
+    if (queued_remote) remote_.cv.notify_one();
     notify_workers(queued);
   }
 
@@ -883,13 +843,8 @@ class Core {
       stats_.dedup_rows += group - 1;
       *fresh = true;
     }
-    if (*fresh && m.remote) remote_kick_.fetch_add(1);
+    if (*fresh && m.remote) remote_.kick.fetch_add(1);
     return r;
-  }
-
-  bool remote_usable_locked() const {
-    return remote_state_ == RemoteState::kUploading ||
-           remote_state_ == RemoteState::kReady;
   }
 
   // Returns true when the job just completed.
@@ -1075,7 +1030,7 @@ class Core {
     if (it != inflight_.end() && it->second == r) inflight_.erase(it);
     r->finished = true;
     std::vector<Use> uses = std::move(r->uses);
-    const bool fallback = remote_.fallback_to_disk && !closed_;
+    const bool fallback = remote_.params.fallback_to_disk && !closed_;
     if (fallback) ++stats_.remote_requeued;
     bool done = false;
     for (Use& u : uses) {
@@ -1095,681 +1050,7 @@ class Core {
     return done;
   }
 
-#ifdef PLE_WITH_UCX
-  void start_remote() {
-    remote_state_ = RemoteState::kConnecting;
-    ucx_thread_ = std::thread([this] { ucx_main(); });
-    const auto guard =
-        std::chrono::duration<double>(remote_.connect_timeout_s + 30.0);
-    std::unique_lock<std::mutex> lk(mu_);
-    if (!cv_setup_.wait_for(lk, guard, [&] { return remote_setup_done_; })) {
-      remote_state_ = RemoteState::kFailed;
-      remote_error_ = "timed out setting up the remote memory source";
-    }
-    const bool failed = remote_state_ == RemoteState::kFailed;
-    if (failed && !remote_.fallback_to_disk) {
-      const std::string msg =
-          "PLE remote memory setup failed: " + remote_error_;
-      lk.unlock();
-      stop_remote_.store(true);
-      cv_remote_.notify_all();
-      ucx_thread_.join();
-      free_stage_buffers();
-      close_fds();
-      std::free(slab_);
-      slab_ = nullptr;
-      throw std::runtime_error(msg);
-    }
-    if (!failed) upload_thread_ = std::thread([this] { upload_main(); });
-  }
-
-  static void ep_err_cb(void* arg, ucp_ep_h, ucs_status_t status) {
-    auto* u = static_cast<Ucx*>(arg);
-    if (!u->ep_failed) u->ep_status = status;
-    u->ep_failed = true;
-  }
-
-  static ucs_status_t reply_cb(void* arg, const void*, size_t, void* data,
-                               size_t length, const ucp_am_recv_param_t* p) {
-    if (p->recv_attr & UCP_AM_RECV_ATTR_FLAG_RNDV) return UCS_OK;
-    const char* d = static_cast<const char*>(data);
-    static_cast<Ucx*>(arg)->replies.emplace_back(d, d + length);
-    return UCS_OK;
-  }
-
-  static void get_cb(void* request, ucs_status_t status, void* user_data) {
-    auto* op = static_cast<GetOp*>(user_data);
-    op->status = status;
-    --op->ucx->outstanding;
-    op->ucx->get_done.push_back(op->slot);
-    ucp_request_free(request);
-  }
-
-  static void chunk_cb(void* request, ucs_status_t status, void* user_data) {
-    auto* op = static_cast<ChunkOp*>(user_data);
-    if (status != UCS_OK) op->status = status;
-    --op->ucx->outstanding;
-    if (--op->outstanding == 0) op->ucx->chunk_done.push_back(op->buf);
-    ucp_request_free(request);
-  }
-
-  static std::string ucs_error(const char* what, ucs_status_t st) {
-    return std::string(what) + ": " + ucs_status_string(st);
-  }
-
-  ucs_status_t mem_map(Ucx& u, void* addr, size_t len, ucp_mem_h* memh) {
-    ucp_mem_map_params_t mp{};
-    mp.field_mask =
-        UCP_MEM_MAP_PARAM_FIELD_ADDRESS | UCP_MEM_MAP_PARAM_FIELD_LENGTH;
-    mp.address = addr;
-    mp.length = len;
-    return ucp_mem_map(u.ctx, &mp, memh);
-  }
-
-  size_t stage_bytes() const {
-    const uint64_t data = remote_.chunk_rows * rb_;
-    return (data + kPage - 1) / kPage * kPage + 2 * kPage;
-  }
-
-  void am_send(Ucx& u, std::vector<char> payload) {
-    ucp_request_param_t p{};
-    p.op_attr_mask = UCP_OP_ATTR_FIELD_FLAGS;
-    p.flags = UCP_AM_SEND_FLAG_EAGER | UCP_AM_SEND_FLAG_REPLY;
-    void* req = ucp_am_send_nbx(u.ep, ple_mem::kAmRequestId, nullptr, 0,
-                                payload.data(), payload.size(), &p);
-    if (UCS_PTR_IS_PTR(req)) u.sends.push_back(AmSend{req, std::move(payload)});
-  }
-
-  void reap_sends(Ucx& u) {
-    for (auto it = u.sends.begin(); it != u.sends.end();) {
-      if (ucp_request_check_status(it->request) == UCS_INPROGRESS) {
-        ++it;
-        continue;
-      }
-      ucp_request_free(it->request);
-      it = u.sends.erase(it);
-    }
-  }
-
-  // Progresses until `req` completes or `deadline`; frees it either way.
-  ucs_status_t wait_request(Ucx& u, void* req, double deadline_us) {
-    if (req == nullptr) return UCS_OK;
-    if (UCS_PTR_IS_ERR(req)) return UCS_PTR_STATUS(req);
-    ucs_status_t st;
-    while ((st = ucp_request_check_status(req)) == UCS_INPROGRESS &&
-           now_us() < deadline_us)
-      ucp_worker_progress(u.worker);
-    ucp_request_free(req);
-    return st;
-  }
-
-  // Creates the context, worker and endpoint, borrows every region and
-  // registers the local buffers. Returns an error message on failure.
-  std::string ucx_setup(Ucx& u, uint64_t num_rows) {
-    sockaddr_storage addr{};
-    socklen_t addrlen = 0;
-    std::string err;
-    if (!ple_mem::resolve_address(remote_.server, &addr, &addrlen, &err))
-      return err;
-
-    ucp_config_t* config = nullptr;
-    ucs_status_t st = ucp_config_read(nullptr, nullptr, &config);
-    if (st != UCS_OK) return ucs_error("ucp_config_read", st);
-    ucp_params_t params{};
-    params.field_mask = UCP_PARAM_FIELD_FEATURES;
-    params.features = UCP_FEATURE_RMA | UCP_FEATURE_AM;
-    st = ucp_init(&params, config, &u.ctx);
-    ucp_config_release(config);
-    if (st != UCS_OK) return ucs_error("ucp_init", st);
-    ucp_worker_params_t wp{};
-    wp.field_mask = UCP_WORKER_PARAM_FIELD_THREAD_MODE;
-    wp.thread_mode = UCS_THREAD_MODE_SINGLE;
-    st = ucp_worker_create(u.ctx, &wp, &u.worker);
-    if (st != UCS_OK) return ucs_error("ucp_worker_create", st);
-    ucp_am_handler_param_t am{};
-    am.field_mask =
-        UCP_AM_HANDLER_PARAM_FIELD_ID | UCP_AM_HANDLER_PARAM_FIELD_FLAGS |
-        UCP_AM_HANDLER_PARAM_FIELD_CB | UCP_AM_HANDLER_PARAM_FIELD_ARG;
-    am.id = ple_mem::kAmReplyId;
-    am.flags = UCP_AM_FLAG_WHOLE_MSG;
-    am.cb = &Core::reply_cb;
-    am.arg = &u;
-    st = ucp_worker_set_am_recv_handler(u.worker, &am);
-    if (st != UCS_OK) return ucs_error("ucp_worker_set_am_recv_handler", st);
-
-    const uint32_t slots = remote_.max_inflight;
-    const size_t slab_bytes = (size_t{slots} * rb_ + kPage - 1) / kPage * kPage;
-    void* p = nullptr;
-    if (posix_memalign(&p, kPage, slab_bytes) != 0)
-      return "cannot allocate the remote read slab";
-    u.get_slab = static_cast<uint8_t*>(p);
-    st = mem_map(u, u.get_slab, slab_bytes, &u.get_memh);
-    if (st != UCS_OK) return ucs_error("ucp_mem_map", st);
-    u.gets.resize(slots);
-    for (uint32_t s = 0; s < slots; ++s) {
-      u.gets[s].ucx = &u;
-      u.gets[s].slot = s;
-    }
-    for (uint32_t s = slots; s-- > 0;) u.get_free.push_back(s);
-    u.chunks.resize(kUploadBuffers);
-    for (uint32_t b = 0; b < kUploadBuffers; ++b) {
-      if (posix_memalign(&p, kPage, stage_bytes()) != 0)
-        return "cannot allocate the upload staging buffers";
-      u.stage.push_back(static_cast<uint8_t*>(p));
-      ucp_mem_h memh = nullptr;
-      st = mem_map(u, p, stage_bytes(), &memh);
-      if (st != UCS_OK) return ucs_error("ucp_mem_map", st);
-      u.stage_memh.push_back(memh);
-      u.chunks[b].ucx = &u;
-      u.chunks[b].buf = b;
-    }
-
-    ucp_ep_params_t ep{};
-    ep.field_mask = UCP_EP_PARAM_FIELD_FLAGS | UCP_EP_PARAM_FIELD_SOCK_ADDR |
-                    UCP_EP_PARAM_FIELD_ERR_HANDLER |
-                    UCP_EP_PARAM_FIELD_ERR_HANDLING_MODE;
-    ep.flags = UCP_EP_PARAMS_FLAGS_CLIENT_SERVER;
-    ep.sockaddr.addr = reinterpret_cast<const sockaddr*>(&addr);
-    ep.sockaddr.addrlen = addrlen;
-    ep.err_mode = UCP_ERR_HANDLING_MODE_PEER;
-    ep.err_handler.cb = &Core::ep_err_cb;
-    ep.err_handler.arg = &u;
-    st = ucp_ep_create(u.worker, &ep, &u.ep);
-    if (st != UCS_OK) {
-      u.ep = nullptr;
-      return "cannot connect to " + remote_.server + ": " +
-             ucs_status_string(st);
-    }
-
-    const uint64_t n =
-        (num_rows + remote_.region_rows - 1) / remote_.region_rows;
-    u.regions.resize(n);
-    for (uint64_t i = 0; i < n; ++i) {
-      const uint64_t rows =
-          std::min(remote_.region_rows, num_rows - i * remote_.region_rows);
-      ple_mem::AllocReq req{};
-      req.hdr = ple_mem::make_header(ple_mem::kAllocReq);
-      req.cookie = i;
-      req.bytes = rows * rb_;
-      std::vector<char> payload(sizeof(req));
-      std::memcpy(payload.data(), &req, sizeof(req));
-      am_send(u, std::move(payload));
-    }
-    const double deadline = now_us() + remote_.connect_timeout_s * 1e6;
-    while (u.replies.size() < n && !u.ep_failed && !stop_remote_.load()) {
-      if (now_us() > deadline)
-        return "timed out after " + std::to_string(remote_.connect_timeout_s) +
-               " s connecting to " + remote_.server + " (" +
-               std::to_string(u.replies.size()) + " of " + std::to_string(n) +
-               " regions granted)";
-      ucp_worker_progress(u.worker);
-      reap_sends(u);
-    }
-    if (u.ep_failed)
-      return "cannot reach " + remote_.server + ": " +
-             ucs_status_string(u.ep_status);
-    if (stop_remote_.load()) return "reader closed during setup";
-    std::vector<char> granted(n, 0);
-    for (const auto& m : u.replies) {
-      ple_mem::AllocRep rep;
-      if (ple_mem::message_type(m.data(), m.size()) != ple_mem::kAllocRep ||
-          m.size() < sizeof(rep))
-        return "invalid reply from " + remote_.server;
-      std::memcpy(&rep, m.data(), sizeof(rep));
-      if (rep.cookie >= n || granted[rep.cookie])
-        return "unexpected reply from " + remote_.server;
-      if (rep.status != 0) {
-        rep.error[sizeof(rep.error) - 1] = '\0';
-        return remote_.server + " refused " + std::to_string(n) +
-               " regions: " + rep.error;
-      }
-      if (m.size() < sizeof(rep) + rep.rkey_len)
-        return "truncated reply from " + remote_.server;
-      RemoteRegion& reg = u.regions[rep.cookie];
-      reg.id = rep.region_id;
-      reg.addr = rep.addr;
-      reg.bytes = rep.bytes;
-      granted[rep.cookie] = 1;
-      st = ucp_ep_rkey_unpack(u.ep, m.data() + sizeof(rep), &reg.rkey);
-      if (st != UCS_OK) {
-        reg.rkey = nullptr;
-        return ucs_error("ucp_ep_rkey_unpack", st);
-      }
-    }
-    u.replies.clear();
-    return "";
-  }
-
-  void ucx_main() {
-    Ucx u;
-    const uint64_t num_rows =
-        seg_start_.empty() ? 0 : seg_start_.back() + seg_rows_.back();
-    std::string err = ucx_setup(u, num_rows);
-    {
-      std::lock_guard<std::mutex> lk(mu_);
-      stage_bufs_ = u.stage;
-      if (remote_state_ == RemoteState::kFailed) err = remote_error_;
-      if (err.empty()) {
-        remote_state_ = RemoteState::kUploading;
-        remote_regions_ = u.regions.size();
-        for (uint32_t b = 0; b < kUploadBuffers; ++b) upload_free_.push_back(b);
-      } else {
-        remote_state_ = RemoteState::kFailed;
-        remote_error_ = err;
-      }
-      remote_setup_done_ = true;
-    }
-    cv_setup_.notify_all();
-    if (err.empty()) ucx_loop(u);
-    ucx_teardown(u);
-  }
-
-  void ucx_loop(Ucx& u) {
-    std::vector<ReadPtr> reads;
-    std::vector<UploadChunk> ups;
-    for (;;) {
-      const uint64_t kick = remote_kick_.load();
-      const bool need_lock = u.outstanding == 0 || kick != u.seen_kick ||
-                             stop_remote_.load() ||
-                             (u.backlog && !u.get_free.empty());
-      if (need_lock) {
-        std::unique_lock<std::mutex> lk(mu_);
-        if (u.outstanding == 0)
-          cv_remote_.wait_for(lk, std::chrono::milliseconds(1), [&] {
-            return closed_ || remote_kick_.load() != u.seen_kick;
-          });
-        if (closed_) return;
-        u.seen_kick = remote_kick_.load();
-        if (!upload_error_.empty()) {
-          const std::string msg = upload_error_;
-          lk.unlock();
-          remote_fail(u, msg);
-          return;
-        }
-        while (reads.size() < u.get_free.size()) {
-          ReadPtr r = pop_read_locked(rdemand_q_, rhint_q_);
-          if (!r) break;
-          r->started = true;
-          reads.push_back(std::move(r));
-        }
-        u.backlog = !rdemand_q_.empty() || !rhint_q_.empty();
-        while (!upload_q_.empty()) {
-          ups.push_back(upload_q_.front());
-          upload_q_.pop_front();
-        }
-        if (upload_done_ && u.next_seq == upload_chunks_ &&
-            remote_state_ == RemoteState::kUploading)
-          remote_state_ = RemoteState::kReady;
-      }
-      for (const auto& c : ups) post_chunk(u, c);
-      ups.clear();
-      for (auto& r : reads) post_get(u, std::move(r));
-      reads.clear();
-      ucp_worker_progress(u.worker);
-      reap_sends(u);
-      complete_gets(u);
-      const std::string chunk_err = complete_chunks(u);
-      if (u.ep_failed) {
-        remote_fail(u, "connection to " + remote_.server +
-                           " failed: " + ucs_status_string(u.ep_status));
-        return;
-      }
-      if (!chunk_err.empty()) {
-        remote_fail(u, chunk_err);
-        return;
-      }
-    }
-  }
-
-  void post_get(Ucx& u, ReadPtr r) {
-    const uint32_t slot = u.get_free.back();
-    u.get_free.pop_back();
-    GetOp& op = u.gets[slot];
-    const uint64_t row = r->offset;
-    op.read = std::move(r);
-    op.status = UCS_OK;
-    op.t0 = now_us();
-    const RemoteRegion& reg = u.regions[row / remote_.region_rows];
-    const uint64_t raddr = reg.addr + (row % remote_.region_rows) * rb_;
-    ucp_request_param_t p{};
-    p.op_attr_mask = UCP_OP_ATTR_FIELD_CALLBACK | UCP_OP_ATTR_FIELD_USER_DATA |
-                     UCP_OP_ATTR_FIELD_MEMH;
-    p.cb.send = &Core::get_cb;
-    p.user_data = &op;
-    p.memh = u.get_memh;
-    void* req = ucp_get_nbx(u.ep, u.get_slab + size_t{slot} * rb_, rb_, raddr,
-                            reg.rkey, &p);
-    if (UCS_PTR_IS_PTR(req)) {
-      ++u.outstanding;
-      return;
-    }
-    op.status = UCS_PTR_STATUS(req);
-    u.get_done.push_back(slot);
-  }
-
-  // Delivers completed GETs; failed ones are requeued (or failed) after the
-  // remote source is marked failed.
-  void complete_gets(Ucx& u) {
-    if (u.get_done.empty()) return;
-    std::vector<uint32_t> done;
-    done.swap(u.get_done);
-    std::vector<ReadPtr> failed;
-    ucs_status_t first_err = UCS_OK;
-    for (uint32_t slot : done) {
-      GetOp& op = u.gets[slot];
-      ReadPtr r = std::move(op.read);
-      if (op.status == UCS_OK) {
-        finish_read(r, u.get_slab + size_t{slot} * rb_, rb_, 0,
-                    now_us() - op.t0, -1);
-      } else {
-        if (first_err == UCS_OK) first_err = op.status;
-        failed.push_back(std::move(r));
-      }
-      u.get_free.push_back(slot);
-    }
-    if (failed.empty()) return;
-    if (!u.ep_failed) {
-      u.ep_failed = true;
-      u.ep_status = first_err;
-    }
-    mark_failed(std::string("remote read failed: ") +
-                ucs_status_string(first_err));
-    requeue(failed);
-  }
-
-  void post_chunk(Ucx& u, const UploadChunk& c) {
-    ChunkOp& op = u.chunks[c.buf];
-    op.seq = c.seq;
-    op.row_end = c.row + c.rows;
-    op.bytes = c.rows * rb_;
-    op.status = UCS_OK;
-    op.outstanding = 1;
-    const uint8_t* src = u.stage[c.buf] + c.shift;
-    ucp_request_param_t p{};
-    p.op_attr_mask = UCP_OP_ATTR_FIELD_CALLBACK | UCP_OP_ATTR_FIELD_USER_DATA |
-                     UCP_OP_ATTR_FIELD_MEMH;
-    p.cb.send = &Core::chunk_cb;
-    p.user_data = &op;
-    p.memh = u.stage_memh[c.buf];
-    auto track = [&](void* req) {
-      if (UCS_PTR_IS_PTR(req)) {
-        ++op.outstanding;
-        ++u.outstanding;
-      } else if (UCS_PTR_IS_ERR(req)) {
-        op.status = UCS_PTR_STATUS(req);
-      }
-    };
-    for (uint64_t row = c.row; row < op.row_end;) {
-      const RemoteRegion& reg = u.regions[row / remote_.region_rows];
-      const uint64_t in = row % remote_.region_rows;
-      const uint64_t take = std::min(op.row_end - row, reg.bytes / rb_ - in);
-      track(ucp_put_nbx(u.ep, src + (row - c.row) * rb_, take * rb_,
-                        reg.addr + in * rb_, reg.rkey, &p));
-      row += take;
-    }
-    ucp_request_param_t fp{};
-    fp.op_attr_mask = UCP_OP_ATTR_FIELD_CALLBACK | UCP_OP_ATTR_FIELD_USER_DATA;
-    fp.cb.send = &Core::chunk_cb;
-    fp.user_data = &op;
-    track(ucp_ep_flush_nbx(u.ep, &fp));
-    if (--op.outstanding == 0) u.chunk_done.push_back(c.buf);
-  }
-
-  // Recycles flushed staging buffers and advances the ready watermark over
-  // the contiguous prefix of visible chunks. Returns an error message when a
-  // put or flush failed.
-  std::string complete_chunks(Ucx& u) {
-    if (u.chunk_done.empty()) return "";
-    std::vector<uint32_t> done;
-    done.swap(u.chunk_done);
-    std::string err;
-    for (uint32_t b : done) {
-      const ChunkOp& op = u.chunks[b];
-      if (op.status != UCS_OK && err.empty())
-        err = ucs_error("remote upload failed", op.status);
-      u.visible[op.seq] = {op.row_end, op.bytes};
-    }
-    uint64_t ready = 0, bytes = 0;
-    for (auto it = u.visible.begin();
-         it != u.visible.end() && it->first == u.next_seq;
-         it = u.visible.erase(it)) {
-      ready = it->second.first;
-      bytes += it->second.second;
-      ++u.next_seq;
-    }
-    {
-      std::lock_guard<std::mutex> lk(mu_);
-      for (uint32_t b : done) upload_free_.push_back(b);
-      if (err.empty() && remote_usable_locked()) {
-        remote_uploaded_bytes_ += bytes;
-        if (ready > 0) ready_rows_.store(ready, std::memory_order_release);
-        if (upload_done_ && u.next_seq == upload_chunks_)
-          remote_state_ = RemoteState::kReady;
-      }
-    }
-    cv_upload_.notify_one();
-    return err;
-  }
-
-  // Marks the remote source failed: no new remote reads are planned and the
-  // upload stops. Queued remote reads go back to the SSD (or fail).
-  void mark_failed(const std::string& reason) {
-    size_t queued = 0;
-    bool done = false;
-    {
-      std::lock_guard<std::mutex> lk(mu_);
-      if (remote_state_ != RemoteState::kFailed && !closed_) {
-        remote_state_ = RemoteState::kFailed;
-        remote_error_ = reason;
-        if (!remote_.fallback_to_disk)
-          set_error_locked("PLE remote memory failed: " + reason);
-      }
-      ready_rows_.store(0);
-      upload_stop_ = true;
-      for (auto* q : {&rdemand_q_, &rhint_q_}) {
-        for (auto& r : *q)
-          if (!r->started) done |= requeue_remote_locked(r, &queued);
-        q->clear();
-      }
-    }
-    cv_upload_.notify_all();
-    if (done) cv_done_.notify_all();
-    notify_workers(queued);
-  }
-
-  void requeue(const std::vector<ReadPtr>& reads) {
-    size_t queued = 0;
-    bool done = false;
-    {
-      std::lock_guard<std::mutex> lk(mu_);
-      for (const auto& r : reads) done |= requeue_remote_locked(r, &queued);
-    }
-    if (done) cv_done_.notify_all();
-    notify_workers(queued);
-  }
-
-  void remote_fail(Ucx& u, const std::string& reason) {
-    if (!u.ep_failed) {
-      u.ep_failed = true;
-      u.ep_status = UCS_ERR_CANCELED;
-    }
-    mark_failed(reason);
-  }
-
-  // Drains outstanding operations, returns the regions and releases every
-  // UCX resource. Reads still in flight are requeued or failed.
-  void ucx_teardown(Ucx& u) {
-    if (u.ep != nullptr && !u.ep_failed) {
-      const double drain = now_us() + 5e6;
-      while (u.outstanding > 0 && now_us() < drain) {
-        ucp_worker_progress(u.worker);
-        complete_gets(u);
-        complete_chunks(u);
-      }
-    }
-    const bool graceful = u.ep != nullptr && !u.ep_failed && u.outstanding == 0;
-    if (graceful) {
-      for (const auto& reg : u.regions) {
-        if (reg.rkey == nullptr) continue;
-        ple_mem::FreeReq req{};
-        req.hdr = ple_mem::make_header(ple_mem::kFreeReq);
-        req.region_id = reg.id;
-        std::vector<char> payload(sizeof(req));
-        std::memcpy(payload.data(), &req, sizeof(req));
-        am_send(u, std::move(payload));
-      }
-    }
-    bool flushed = false;
-    if (graceful) {
-      ucp_request_param_t fp{};
-      flushed = wait_request(u, ucp_ep_flush_nbx(u.ep, &fp), now_us() + 2e6) ==
-                UCS_OK;
-      reap_sends(u);
-    }
-    if (flushed) destroy_rkeys(u);
-    if (u.ep != nullptr) {
-      ucp_request_param_t cp{};
-      cp.op_attr_mask = UCP_OP_ATTR_FIELD_FLAGS;
-      cp.flags = flushed ? 0 : UCP_EP_CLOSE_FLAG_FORCE;
-      wait_request(u, ucp_ep_close_nbx(u.ep, &cp), now_us() + 2e6);
-      u.ep = nullptr;
-    }
-    complete_gets(u);
-    complete_chunks(u);
-    std::vector<ReadPtr> stuck;
-    for (auto& op : u.gets)
-      if (op.read) stuck.push_back(std::move(op.read));
-    requeue(stuck);
-    for (auto& s : u.sends) ucp_request_free(s.request);
-    u.sends.clear();
-    destroy_rkeys(u);
-    if (u.get_memh != nullptr) ucp_mem_unmap(u.ctx, u.get_memh);
-    for (ucp_mem_h m : u.stage_memh) ucp_mem_unmap(u.ctx, m);
-    if (u.worker != nullptr) ucp_worker_destroy(u.worker);
-    if (u.ctx != nullptr) ucp_cleanup(u.ctx);
-    {
-      std::lock_guard<std::mutex> lk(mu_);
-      upload_stop_ = true;
-    }
-    cv_upload_.notify_all();
-    std::free(u.get_slab);
-  }
-
-  // The upload thread may still read into a staging buffer after the UCX
-  // thread is gone, so they are freed once both threads were joined.
-  void free_stage_buffers() {
-    for (uint8_t* b : stage_bufs_) std::free(b);
-    stage_bufs_.clear();
-  }
-
-  void destroy_rkeys(Ucx& u) {
-    for (auto& reg : u.regions) {
-      if (reg.rkey != nullptr) ucp_rkey_destroy(reg.rkey);
-      reg.rkey = nullptr;
-    }
-  }
-
-  // Reads the segments in row order into the staging buffers and hands each
-  // filled buffer to the UCX thread.
-  void upload_main() {
-    std::vector<int> fds;
-    bool direct = direct_atomic_.load();
-    std::string err;
-    for (const auto& path : paths_) {
-      int fd = direct ? ::open(path.c_str(), O_RDONLY | O_DIRECT) : -1;
-      if (fd < 0) {
-        direct = false;
-        fd = ::open(path.c_str(), O_RDONLY);
-      }
-      if (fd < 0) {
-        err = "upload cannot open " + path + ": " + strerror(errno);
-        break;
-      }
-      fds.push_back(fd);
-    }
-    uint64_t seq = 0;
-    for (size_t s = 0; err.empty() && s < seg_start_.size(); ++s) {
-      for (uint64_t r = 0; r < seg_rows_[s];) {
-        const uint64_t n = std::min(remote_.chunk_rows, seg_rows_[s] - r);
-        uint32_t b;
-        uint8_t* buf;
-        {
-          std::unique_lock<std::mutex> lk(mu_);
-          cv_upload_.wait(lk, [&] {
-            return upload_stop_ || closed_ || !upload_free_.empty();
-          });
-          if (upload_stop_ || closed_) {
-            for (int fd : fds) ::close(fd);
-            return;
-          }
-          b = upload_free_.back();
-          upload_free_.pop_back();
-          buf = stage_bufs_[b];
-        }
-        const uint64_t off = seg_offset_[s] + r * rb_;
-        const uint64_t start = off & ~(kPage - 1);
-        const uint64_t end = (off + n * rb_ + kPage - 1) & ~(kPage - 1);
-        const int fd = fds[seg_file_[s]];
-        size_t got = 0;
-        while (got < end - start) {
-          const ssize_t g = ::pread(fd, buf + got, end - start - got,
-                                    static_cast<off_t>(start + got));
-          if (g < 0 && errno == EINTR) continue;
-          if (g < 0 && errno == EINVAL && direct) {
-            direct = false;
-            for (int f : fds) {
-              const int fl = fcntl(f, F_GETFL);
-              if (fl >= 0) fcntl(f, F_SETFL, fl & ~O_DIRECT);
-            }
-            continue;
-          }
-          if (g < 0) {
-            err = "upload pread failed at offset " +
-                  std::to_string(start + got) + ": " + strerror(errno);
-            break;
-          }
-          if (g == 0) break;
-          got += static_cast<size_t>(g);
-        }
-        if (err.empty() && got < off - start + n * rb_)
-          err = "upload short read at offset " + std::to_string(off) +
-                ": file truncated?";
-        if (!direct)
-          posix_fadvise(fd, static_cast<off_t>(start),
-                        static_cast<off_t>(end - start), POSIX_FADV_DONTNEED);
-        {
-          std::lock_guard<std::mutex> lk(mu_);
-          if (!err.empty()) {
-            upload_free_.push_back(b);
-            break;
-          }
-          upload_q_.push_back(UploadChunk{seq++, b,
-                                          static_cast<uint32_t>(off - start),
-                                          seg_start_[s] + r, n});
-          remote_kick_.fetch_add(1);
-        }
-        cv_remote_.notify_one();
-        r += n;
-      }
-    }
-    for (int fd : fds) ::close(fd);
-    {
-      std::lock_guard<std::mutex> lk(mu_);
-      if (err.empty()) {
-        upload_done_ = true;
-        upload_chunks_ = seq;
-      } else {
-        upload_error_ = err;
-      }
-      remote_kick_.fetch_add(1);
-    }
-    cv_remote_.notify_one();
-  }
-
-  std::vector<uint8_t*> stage_bufs_;
-  std::deque<UploadChunk> upload_q_;
-  std::vector<uint32_t> upload_free_;
-#endif
+  void start_remote();
 
   const uint32_t rb_;
   const double timeout_us_;
@@ -1796,24 +1077,9 @@ class Core {
   LatencyRing latency_, remote_latency_;
   std::string error_;
 
-  // Remote source. Fields below are guarded by mu_ unless atomic.
-  RemoteParams remote_;
-  RemoteState remote_state_ = RemoteState::kDisabled;
-  std::string remote_error_;
-  uint64_t remote_total_bytes_ = 0;
-  uint64_t remote_uploaded_bytes_ = 0;
-  uint64_t remote_regions_ = 0;
-  std::atomic<uint64_t> ready_rows_{0};
-  std::atomic<uint64_t> remote_kick_{0};
-  std::atomic<bool> stop_remote_{false};
+  // Remote source state, guarded by mu_ like the remote read queues.
+  ple_remote::Link remote_;
   std::deque<ReadPtr> rdemand_q_, rhint_q_;
-  std::condition_variable cv_remote_, cv_upload_, cv_setup_;
-  bool remote_setup_done_ = false;
-  bool upload_stop_ = false;
-  bool upload_done_ = false;
-  uint64_t upload_chunks_ = 0;
-  std::string upload_error_;
-  std::thread ucx_thread_, upload_thread_;
 
   const int64_t* bound_ids_ = nullptr;
   const int64_t* bound_num_tokens_ = nullptr;
@@ -1826,7 +1092,62 @@ class Core {
   size_t num_workers_ = 0;
   std::thread planner_;
   std::vector<std::thread> workers_;
+  RemoteFactory remote_make_ = nullptr;
+  // Last, so it is destroyed before the state it refers to.
+  std::unique_ptr<ple_remote::RemoteSourceBase> remote_src_;
 };
+
+template <class Transport>
+std::unique_ptr<ple_remote::RemoteSourceBase> make_remote_source(
+    Core& core, ple_remote::Layout layout, bool direct_io) {
+  return std::make_unique<ple_remote::RemoteSource<Core, Transport>>(
+      core, std::move(layout), direct_io);
+}
+
+struct RemoteBackend {
+  const char* name;
+  RemoteFactory make;
+};
+
+// Backends compiled into this variant, null-terminated. One is picked by name
+// when the reader starts; its RemoteSource<Transport> then serves every read.
+constexpr RemoteBackend kRemoteBackends[] = {
+#ifdef PLE_WITH_UCX
+    {ple_remote::UcxTransport::kName,
+     &make_remote_source<ple_remote::UcxTransport>},
+#endif
+#ifdef PLE_WITH_LOOPBACK
+    {ple_remote::LoopbackTransport::kName,
+     &make_remote_source<ple_remote::LoopbackTransport>},
+#endif
+    {nullptr, nullptr},
+};
+
+RemoteFactory find_remote_backend(const std::string& name) {
+  for (const RemoteBackend* b = kRemoteBackends; b->name != nullptr; ++b)
+    if (name == b->name) return b->make;
+  return nullptr;
+}
+
+std::vector<std::string> remote_backend_names() {
+  std::vector<std::string> names;
+  for (const RemoteBackend* b = kRemoteBackends; b->name != nullptr; ++b)
+    names.emplace_back(b->name);
+  return names;
+}
+
+void Core::start_remote() {
+  ple_remote::Layout layout{rb_,         paths_,     seg_file_,
+                            seg_offset_, seg_start_, seg_rows_};
+  remote_src_ = remote_make_(*this, std::move(layout), direct_);
+  const std::string err = remote_src_->start();
+  if (err.empty()) return;
+  remote_src_.reset();
+  close_fds();
+  std::free(slab_);
+  slab_ = nullptr;
+  throw std::runtime_error("PLE remote memory setup failed: " + err);
+}
 
 // Python handle. Once a host function referencing the core was enqueued, a
 // captured CUDA graph may still call into it, so the (closed, small) core is
@@ -1861,13 +1182,13 @@ class Reader {
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   using Release = py::call_guard<py::gil_scoped_release>;
   py::class_<Reader>(m, "Reader")
-      .def(
-          py::init<const std::vector<std::string>&, const std::vector<int64_t>&,
-                   const std::vector<int64_t>&, const std::vector<int64_t>&,
-                   const std::vector<int64_t>&, int64_t, int64_t, int64_t,
-                   int64_t, bool, double, const std::string&, int64_t, int64_t,
-                   int64_t, double, bool>(),
-          Release())
+      .def(py::init<const std::vector<std::string>&,
+                    const std::vector<int64_t>&, const std::vector<int64_t>&,
+                    const std::vector<int64_t>&, const std::vector<int64_t>&,
+                    int64_t, int64_t, int64_t, int64_t, bool, double,
+                    const std::string&, const std::string&, int64_t, int64_t,
+                    int64_t, double, bool>(),
+           Release())
       .def("close", &Reader::close, Release())
       .def(
           "read_rows",
@@ -1896,12 +1217,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("direct_io", [](Reader& r) { return r.core().direct_io(); })
       .def("stats", [](Reader& r) { return r.core().stats(); })
       .def("remote_status", [](Reader& r) { return r.core().remote_status(); })
-      .def("reset_stats", [](Reader& r) { r.core().reset_stats(); })
-      .def_property_readonly_static("with_ucx", [](py::object) {
-#ifdef PLE_WITH_UCX
-        return true;
-#else
-        return false;
-#endif
-      });
+      .def("reset_stats", [](Reader& r) { r.core().reset_stats(); });
+  m.attr("REMOTE_BACKENDS") = py::tuple(py::cast(remote_backend_names()));
 }

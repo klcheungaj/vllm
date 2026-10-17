@@ -3,11 +3,13 @@
 """Tests for the PLE reader's remote memory source and the standalone memory
 server / benchmark (``ple_mem_server/``).
 
-The server runs as a subprocess over UCX's TCP transport (software RMA), so
-no RDMA hardware is needed; the module is skipped when UCX, make or g++ is
-missing.
+Transport-agnostic behavior runs against the in-process ``loopback`` backend,
+and against UCX when available. The UCX server runs as a subprocess over UCX's
+TCP transport (software RMA), so no RDMA hardware is needed; UCX tests are
+skipped when UCX, make or g++ is missing.
 """
 
+import dataclasses
 import os
 import shutil
 import signal
@@ -15,6 +17,7 @@ import subprocess
 import sys
 import threading
 import time
+from dataclasses import dataclass
 
 import numpy as np
 import pytest
@@ -22,20 +25,22 @@ import regex as re
 import torch
 
 import vllm.models.qwen4_exp.common as qwen4_common
+import vllm.models.qwen4_exp.common.ple_disk_reader as reader_module
 from vllm.models.qwen4_exp.common.ple_disk_reader import (
+    REMOTE_BACKENDS,
     PLEDiskReader,
     PLERemoteOptions,
+    available_remote_backends,
+    load_extension,
     ucx_build_flags,
 )
 
-from .test_ple_disk_reader import NUM_ROWS, ROW_BYTES, _mixed_ids, _Table
+from .test_ple_disk_reader import HEADER_A, NUM_ROWS, ROW_BYTES, _mixed_ids, _Table
 
 SERVER_DIR = os.path.join(os.path.dirname(qwen4_common.__file__), "ple_mem_server")
 
 
 def _ucx_missing() -> str:
-    if not sys.platform.startswith("linux"):
-        return "PLE disk reader is Linux-only"
     if not (shutil.which("make") and shutil.which("g++")):
         return "make and g++ are required"
     try:
@@ -45,7 +50,11 @@ def _ucx_missing() -> str:
     return ""
 
 
-pytestmark = pytest.mark.skipif(bool(_ucx_missing()), reason=_ucx_missing())
+pytestmark = pytest.mark.skipif(
+    not sys.platform.startswith("linux"), reason="PLE disk reader is Linux-only"
+)
+_UCX_MISSING = _ucx_missing()
+requires_ucx = pytest.mark.skipif(bool(_UCX_MISSING), reason=_UCX_MISSING)
 
 REGION_BYTES = 100_003  # 625 rows, not aligned to pages, chunks or segments
 REGION_ROWS = REGION_BYTES // ROW_BYTES
@@ -126,7 +135,22 @@ def start_server(bin_dir, monkeypatch):
         server.kill()
 
 
-def _reader(segments, address: str, **kwargs) -> PLEDiskReader:
+@dataclass
+class _Remote:
+    backend: str
+    address: str
+    server: _Server | None = None
+
+
+@pytest.fixture(params=["loopback", pytest.param("ucx", marks=requires_ucx)])
+def remote(request) -> _Remote:
+    if request.param == "loopback":
+        return _Remote("loopback", "loopback")
+    server = request.getfixturevalue("start_server")()
+    return _Remote("ucx", server.address, server)
+
+
+def _reader(segments, address: str, backend: str = "ucx", **kwargs) -> PLEDiskReader:
     remote = dict(
         region_bytes=REGION_BYTES,
         upload_chunk_bytes=CHUNK_BYTES,
@@ -140,7 +164,7 @@ def _reader(segments, address: str, **kwargs) -> PLEDiskReader:
         max_inflight=64,
         direct_io=True,
         wait_timeout_s=30.0,
-        remote=PLERemoteOptions(address, **remote),
+        remote=PLERemoteOptions(address, backend, **remote),
     )
     args.update(kwargs)
     return PLEDiskReader(segments, ROW_BYTES, **args)
@@ -152,8 +176,12 @@ def _read(reader: PLEDiskReader, ids: np.ndarray) -> np.ndarray:
     return out.numpy().reshape(ids.size, ROW_BYTES)
 
 
-def _boundary_ids() -> np.ndarray:
-    edges = np.arange(REGION_ROWS, NUM_ROWS, REGION_ROWS, dtype=np.int64)
+def _loopback(segments, query: str = "", **kwargs) -> PLEDiskReader:
+    return _reader(segments, "loopback" + query, "loopback", **kwargs)
+
+
+def _boundary_ids(region_rows: int = REGION_ROWS) -> np.ndarray:
+    edges = np.arange(region_rows, NUM_ROWS, region_rows, dtype=np.int64)
     return np.concatenate([edges - 1, edges])
 
 
@@ -164,11 +192,10 @@ def _wait_state(reader: PLEDiskReader, state: str, timeout_s: float = 10.0) -> N
         time.sleep(0.01)
 
 
-def test_remote_reads_bit_exact(table, start_server):
+def test_remote_reads_bit_exact(table, remote):
     """After the upload every row (incl. ones at region edges, page-straddling
     and out-of-range ids) comes from the server, matching the files."""
-    server = start_server()
-    reader = _reader(table.segments, server.address)
+    reader = _reader(table.segments, remote.address, remote.backend)
     try:
         assert reader.wait_remote_ready(30)
         status = reader.remote_status()
@@ -185,20 +212,23 @@ def test_remote_reads_bit_exact(table, start_server):
         reader.check_error()
     finally:
         reader.close()
-    line = server.wait_for("disconnected")
-    assert "releasing 0 regions" in line
+    if remote.server is not None:
+        line = remote.server.wait_for("disconnected")
+        assert "releasing 0 regions" in line
 
 
-def test_reads_during_upload(table, start_server):
+def test_reads_during_upload(table, remote):
     """Reads issued while the table is uploading mix SSD and remote rows and
     stay exact; the watermark skips the gap between two segments."""
-    server = start_server()
+    address = remote.address
+    if remote.backend == "loopback":
+        address += "?delay_us=200"  # keeps the upload running for a while
     gap_segments = [
         table.segments[0],
         table.segments[2],
     ]
     reader = _reader(
-        gap_segments, server.address, remote={"upload_chunk_bytes": 16_000}
+        gap_segments, address, remote.backend, remote={"upload_chunk_bytes": 16_000}
     )
     try:
         assert reader.remote_status()["state"] == "uploading"
@@ -220,9 +250,8 @@ def test_reads_during_upload(table, start_server):
         reader.close()
 
 
-def test_hints_prefetch_from_remote(table, start_server):
-    server = start_server()
-    reader = _reader(table.segments, server.address, cache_rows=4096)
+def test_hints_prefetch_from_remote(table, remote):
+    reader = _reader(table.segments, remote.address, remote.backend, cache_rows=4096)
     try:
         assert reader.wait_remote_ready(30)
         ids = np.random.default_rng(3).choice(NUM_ROWS, 64, replace=False)
@@ -242,6 +271,158 @@ def test_hints_prefetch_from_remote(table, start_server):
         reader.close()
 
 
+def test_chunks_spanning_many_regions(table):
+    """Regions much smaller than an upload chunk (and not aligned to rows):
+    each chunk is split into several puts, rows at every edge stay exact."""
+    region_bytes = 7_001
+    region_rows = region_bytes // ROW_BYTES
+    reader = _loopback(table.segments, remote={"region_bytes": region_bytes})
+    try:
+        assert reader.wait_remote_ready(30)
+        assert reader.remote_status()["regions"] == -(-NUM_ROWS // region_rows)
+        reader.reset_stats()
+        ids = _boundary_ids(region_rows)
+        np.testing.assert_array_equal(_read(reader, ids), table.expected(ids))
+        assert reader.stats()["reads"] == 0
+    finally:
+        reader.close()
+
+
+# The upload of the test table posts fewer than 1000 puts (643 chunks plus
+# region straddles), so 100 fails it mid-upload and 2000 under reads.
+@pytest.mark.parametrize("fallback", [True, False])
+@pytest.mark.parametrize("fail_after", [100, 2000], ids=["upload", "reads"])
+def test_transport_failure(table, fail_after, fallback):
+    """A transport failing mid-upload or under reads fails the remote source.
+    With fallback, in-flight reads move to the SSD and stay exact; without,
+    they fail and the error is recorded. Later reads come from the SSD."""
+    reader = _loopback(
+        table.segments,
+        f"?fail_after={fail_after}",
+        remote={"fallback_to_disk": fallback},
+    )
+    try:
+        ids = _mixed_ids(table, 3000, 9)
+        if fail_after == 2000:
+            assert reader.wait_remote_ready(30)
+            if fallback:
+                np.testing.assert_array_equal(_read(reader, ids), table.expected(ids))
+                assert reader.stats()["remote_requeued"] > 0
+            else:
+                with pytest.raises(RuntimeError, match="remote memory failed"):
+                    _read(reader, ids)
+        _wait_state(reader, "failed")
+        assert "injected failure" in reader.remote_status()["error"]
+        reader.reset_stats()
+        np.testing.assert_array_equal(_read(reader, ids), table.expected(ids))
+        stats = reader.stats()
+        assert stats["reads"] > 0 and stats["remote_reads"] == 0
+        if fallback:
+            reader.check_error()
+        else:
+            with pytest.raises(RuntimeError, match="remote memory failed"):
+                reader.check_error()
+    finally:
+        reader.close()
+
+
+@pytest.mark.parametrize("fallback", [True, False])
+@pytest.mark.parametrize(
+    "query, error",
+    [("?refuse=1", "refused 320 regions"), ("?bogus=1", "invalid loopback address")],
+)
+def test_setup_failure(table, query, error, fallback):
+    """A failed setup leaves the reader disk-only with fallback and fails the
+    constructor without."""
+    remote = {"fallback_to_disk": fallback}
+    if not fallback:
+        with pytest.raises(
+            RuntimeError, match=f"remote memory setup failed: .*{error}"
+        ):
+            _loopback(table.segments, query, remote=remote)
+        return
+    reader = _loopback(table.segments, query, remote=remote)
+    try:
+        status = reader.remote_status()
+        assert status["state"] == "failed"
+        assert error in status["error"]
+        assert not reader.wait_remote_ready(1)
+        ids = _mixed_ids(table, 500, 7)
+        np.testing.assert_array_equal(_read(reader, ids), table.expected(ids))
+        assert reader.stats()["remote_reads"] == 0
+        reader.check_error()
+    finally:
+        reader.close()
+
+
+def test_close_while_uploading(table):
+    """Closing mid-upload with remote reads in flight stops the remote and
+    upload threads promptly; reads still pending fail as closed."""
+    reader = _loopback(
+        table.segments, "?delay_us=2000", remote={"upload_chunk_bytes": 16_000}
+    )
+    errors: list[RuntimeError] = []
+
+    def read_loop() -> None:
+        ids = _mixed_ids(table, 2000, 10)
+        expected = table.expected(ids)
+        try:
+            while True:
+                np.testing.assert_array_equal(_read(reader, ids), expected)
+        except RuntimeError as e:
+            errors.append(e)
+
+    thread = threading.Thread(target=read_loop)
+    try:
+        thread.start()
+        deadline = time.monotonic() + 10
+        while reader.stats()["remote_reads"] == 0:
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
+        assert reader.remote_status()["state"] == "uploading"
+        start = time.monotonic()
+        reader.close()
+        assert time.monotonic() - start < 5
+        thread.join(10)
+        assert not thread.is_alive()
+        assert errors and "closed" in str(errors[0])
+    finally:
+        reader.close()
+        thread.join(10)
+
+
+def test_backend_selection(table):
+    """The remote variant compiles in every available backend and the reader
+    picks one by name at startup; unknown names, and backends missing from
+    the variant, are rejected."""
+    assert REMOTE_BACKENDS == ("ucx",)
+    available = available_remote_backends()
+    assert "loopback" in available
+    assert ("ucx" in available) == (not _UCX_MISSING)
+    assert sorted(load_extension(remote=True).REMOTE_BACKENDS) == list(available)
+    with pytest.raises(ValueError, match="supported: ucx, loopback"):
+        _reader(table.segments, "nope", "nope")
+    disk_only = load_extension()
+    assert disk_only.REMOTE_BACKENDS == ()
+    args = [[table.path_a], [0], [HEADER_A], [0], [10], ROW_BYTES, 0, 1, 1, False]
+    with pytest.raises(ValueError, match=r"not compiled into this reader .*none"):
+        disk_only.Reader(*args, 1.0, "loopback", "loopback", 1, 1, 1, 1.0, True)
+
+
+def test_ucx_requested_without_ucx(table, monkeypatch):
+    """Without UCX the remote variant holds only loopback (built under its own
+    name), and a reader asking for ucx fails with the missing dependency."""
+    ucx = dataclasses.replace(
+        reader_module._REMOTE_BACKENDS["ucx"], missing=lambda: "UCX was not found"
+    )
+    monkeypatch.setitem(reader_module._REMOTE_BACKENDS, "ucx", ucx)
+    assert available_remote_backends() == ("loopback",)
+    assert load_extension(remote=True).REMOTE_BACKENDS == ("loopback",)
+    with pytest.raises(RuntimeError, match="'ucx' is not available: UCX was not"):
+        _reader(table.segments, "127.0.0.1:1", "ucx")
+
+
+@requires_ucx
 def test_server_killed_falls_back_to_disk(table, start_server):
     """Killing the server under load moves queued and in-flight remote reads
     to the SSD; every read stays exact and no error is recorded."""
@@ -286,6 +467,7 @@ def test_server_killed_falls_back_to_disk(table, start_server):
         reader.close()
 
 
+@requires_ucx
 def test_server_killed_without_fallback_errors(table, start_server):
     server = start_server()
     reader = _reader(table.segments, server.address, remote={"fallback_to_disk": False})
@@ -299,6 +481,7 @@ def test_server_killed_without_fallback_errors(table, start_server):
         reader.close()
 
 
+@requires_ucx
 @pytest.mark.parametrize("fallback", [True, False])
 def test_server_out_of_memory(table, start_server, fallback):
     """A server too small for the table fails the setup: disk-only with
@@ -324,6 +507,7 @@ def test_server_out_of_memory(table, start_server, fallback):
     server.wait_for("0 clients, 0 regions")
 
 
+@requires_ucx
 def test_unreachable_server(table, start_server):
     server = start_server()
     address = server.address
@@ -339,6 +523,7 @@ def test_unreachable_server(table, start_server):
         reader.close()
 
 
+@requires_ucx
 def test_bench_verifies_against_server(bin_dir, start_server):
     """The standalone benchmark borrows, uploads, reads back (verified) and
     releases memory; regions straddled by chunks and rows included."""

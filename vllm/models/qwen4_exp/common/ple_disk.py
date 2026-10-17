@@ -343,6 +343,7 @@ class Qwen4ExpPLEDiskEmbedding(Qwen4ExpPLEEmbedding):
         if config.remote_memory_server is not None:
             remote = PLERemoteOptions(
                 server=config.remote_memory_server,
+                backend=config.remote_memory_backend,
                 max_inflight=config.remote_max_inflight,
                 region_bytes=config.remote_region_bytes,
                 upload_chunk_bytes=config.remote_upload_chunk_bytes,
@@ -380,9 +381,10 @@ class Qwen4ExpPLEDiskEmbedding(Qwen4ExpPLEEmbedding):
             status = reader.remote_status()
             self._remote_state = "connecting"
             logger.info(
-                "PLE remote memory for %s: server %s, %d region(s), %.1f GB to "
-                "upload, state %s, fallback_to_disk=%s",
+                "PLE remote memory for %s: %s server %s, %d region(s), %.1f GB "
+                "to upload, state %s, fallback_to_disk=%s",
                 self.prefix,
+                remote.backend,
                 remote.server,
                 int(status["regions"]),
                 int(status["total_bytes"]) / 1e9,

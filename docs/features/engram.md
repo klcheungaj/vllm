@@ -150,8 +150,9 @@ with `dp_shared_memory` and `use_thp`.
 ### Remote memory offload
 
 When another machine on the network has spare RAM, disk offload can borrow
-it over UCX (RDMA over RoCEv2 in production) and serve rows from there
-instead of from the SSD:
+it and serve rows from there instead of from the SSD. The transport is a
+pluggable backend chosen with `remote_memory_backend`; currently `ucx` (RDMA
+such as RoCEv2 or InfiniBand, or TCP, through UCX) is supported:
 
 1. A PLE memory server runs on the machine lending the RAM. It knows nothing
    about models; it only hands out registered memory regions.
@@ -159,8 +160,9 @@ instead of from the SSD:
    and uploads the table from the local checkpoint files in the background.
    Serving starts right away; rows that are not uploaded yet are still read
    from the SSD.
-3. Once uploaded, rows missing from the local row cache are fetched with
-   one-sided RDMA reads, which need no CPU on the server. The row cache
+3. Once uploaded, rows missing from the local row cache are fetched
+   remotely; with UCX over RDMA these are one-sided reads that need no CPU on
+   the server. The row cache
    (`disk_row_cache_rows`) still applies in front of the remote reads.
 
 The checkpoint files stay the upload source and the fallback: with
@@ -168,7 +170,8 @@ The checkpoint files stay the upload source and the fallback: with
 the server cannot be reached at startup or fails later, for the rest of the
 run.
 
-Start the memory server first. It is a standalone program that depends only
+Start the memory server first. The `ucx` backend's server is a standalone
+program that depends only
 on UCX, not on vLLM or Python: copy the
 `vllm/models/qwen4_exp/common/ple_mem_server/` directory to the machine
 lending the RAM and build it with a C++17 compiler and the UCX development
@@ -213,7 +216,8 @@ vllm serve <qwen4exp-checkpoint> \
 
 | Field | Default | Meaning |
 | --- | --- | --- |
-| `remote_memory_server` | `None` | `host:port` (or `[ipv6]:port`) of the memory server; requires `disk_offload`. |
+| `remote_memory_server` | `None` | Address of the memory server, `host:port` (or `[ipv6]:port`) for `ucx`; requires `disk_offload`. |
+| `remote_memory_backend` | `ucx` | Transport used to reach the server. |
 | `remote_max_inflight` | `256` | Maximum outstanding remote row reads. |
 | `remote_region_bytes` | `1073741824` | Size of each borrowed memory region. |
 | `remote_upload_chunk_bytes` | `67108864` | Size of each staging buffer used for the upload. |
@@ -225,8 +229,18 @@ when the upload completes (size and duration) or when the remote source
 fails, and the periodic `PLE disk ...` line adds remote reads, remote read
 latency, and the upload progress while it runs.
 
-**UCX.** With `remote_memory_server` set, the row reader is compiled against
-UCX, so the vLLM machine needs the UCX headers and libraries (for example
+**Backends.** The row reader is a small C++ extension compiled on first use.
+With `remote_memory_server` set, vLLM compiles a variant containing every
+backend whose dependencies it finds on the machine (UCX is found through
+`UCX_HOME` or `pkg-config`), and `remote_memory_backend` picks one of them
+once at startup; selecting a backend that could not be compiled in fails
+with the reason. The plain `disk_offload` variant contains no backend and
+loads no backend library. Each backend's transport is a template parameter
+of the generic remote source, so after startup the per-read path has no
+dynamic dispatch.
+
+**UCX.** The `ucx` variant is compiled against UCX, so the vLLM machine
+needs the UCX headers and shared libraries (for example
 the distribution's `libucx-dev` package, or the UCX bundled with
 MLNX_OFED/DOCA). vLLM finds them through `UCX_HOME` (with `include/` and
 `lib/` below it) or `pkg-config ucx`. The server needs the same UCX
@@ -309,5 +323,6 @@ IPC namespace across the co-located replicas.
   unsupported with elastic expert parallelism.
 - `disk_offload` is Qwen4Exp-only and requires CUDA with TP, DP, and PP sizes
   of 1.
-- `remote_memory_server` requires `disk_offload`, UCX on both machines, and a
-  trusted network; the memory server is unauthenticated.
+- `remote_memory_server` requires `disk_offload` and a trusted network (the
+  memory server is unauthenticated); the `ucx` backend needs UCX on both
+  machines.

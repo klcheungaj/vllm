@@ -10,9 +10,11 @@ CUDA host functions acting on bound pinned buffers, which keeps the path
 capturable in CUDA graphs.
 
 With :class:`PLERemoteOptions`, the table is also uploaded to RAM borrowed
-from a standalone PLE memory server (``ple_mem_server/README.md``) over UCX
-and rows are read back with one-sided GETs; that variant of the extension is
-built against UCX.
+from a memory server and rows are read back with one-sided GETs
+(``csrc/ple_remote_source.h``). The remote variant of the extension compiles
+in every backend whose dependencies are available (e.g. ``ucx``, reaching the
+standalone PLE memory server in ``ple_mem_server/README.md``); the reader
+picks one of them by name when it starts.
 """
 
 import functools
@@ -22,7 +24,7 @@ import subprocess
 import threading
 import time
 import weakref
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -84,18 +86,80 @@ def ucx_build_flags() -> tuple[list[str], list[str]]:
     raise RuntimeError(f"UCX was not found. {_UCX_HINT}")
 
 
+def _no_build_flags() -> tuple[list[str], list[str]]:
+    return [], []
+
+
+def _always_available() -> str:
+    return ""
+
+
+def _ucx_missing() -> str:
+    try:
+        ucx_build_flags()
+    except RuntimeError as e:
+        return str(e)
+    return ""
+
+
+@dataclass(frozen=True)
+class _RemoteBackend:
+    """A remote memory backend the extension can compile in.
+
+    Attributes:
+        define: Macro compiling the backend in.
+        build_flags: Returns its extra ``(cflags, ldflags)``.
+        missing: Availability probe; returns why the backend cannot be built,
+            or ``""``.
+        requires: Dependency named in build errors.
+        hint: How to install it.
+
+    """
+
+    define: str
+    build_flags: Callable[[], tuple[list[str], list[str]]] = _no_build_flags
+    missing: Callable[[], str] = _always_available
+    requires: str = ""
+    hint: str = ""
+
+
+_REMOTE_BACKENDS: dict[str, _RemoteBackend] = {
+    "ucx": _RemoteBackend(
+        "PLE_WITH_UCX",
+        ucx_build_flags,
+        missing=_ucx_missing,
+        requires="UCX",
+        hint=_UCX_HINT,
+    ),
+    # In-process regions with failure injection, for tests.
+    "loopback": _RemoteBackend("PLE_WITH_LOOPBACK"),
+}
+
+REMOTE_BACKENDS = ("ucx",)
+"""Remote memory backends that can be configured for serving."""
+
+
+def available_remote_backends() -> tuple[str, ...]:
+    """Returns the sorted names of the remote backends whose dependencies are
+    available, i.e. those the remote variant of the extension compiles in."""
+    return tuple(
+        sorted(name for name, spec in _REMOTE_BACKENDS.items() if not spec.missing())
+    )
+
+
 @functools.cache
-def _build_extension(with_ucx: bool) -> Any:
+def _build_extension(backends: tuple[str, ...] | None) -> Any:
     from torch.utils.cpp_extension import load
 
     cflags = ["-O3", "-std=c++17"]
     ldflags = ["-ldl", "-lpthread"]
     name = "vllm_ple_disk_reader"
-    if with_ucx:
-        ucx_cflags, ucx_ldflags = ucx_build_flags()
-        cflags += ["-DPLE_WITH_UCX", *ucx_cflags]
-        ldflags += ucx_ldflags
-        name += "_ucx"
+    specs = [_REMOTE_BACKENDS[b] for b in backends or ()]
+    for backend, spec in zip(backends or (), specs):
+        extra_cflags, extra_ldflags = spec.build_flags()
+        cflags += [f"-D{spec.define}", *extra_cflags]
+        ldflags += extra_ldflags
+        name += f"_{backend}"
     try:
         return load(
             name=name,
@@ -104,25 +168,45 @@ def _build_extension(with_ucx: bool) -> Any:
             extra_ldflags=ldflags,
         )
     except Exception as e:
-        hint = f" {_UCX_HINT}" if with_ucx else ""
+        requires = ", ".join(s.requires for s in specs if s.requires)
+        extra = f" plus {requires}" if requires else ""
+        hint = "".join(f" {s.hint}" for s in specs if s.hint)
         raise RuntimeError(
             "Failed to build the PLE disk reader extension. PLE disk offload "
             "JIT-compiles a small C++ extension and needs a C++ compiler "
-            f"(g++) and ninja to be installed{' plus UCX' if with_ucx else ''}:"
-            f" {e}{hint}"
+            f"(g++) and ninja to be installed{extra}: {e}{hint}"
         ) from e
 
 
-def load_extension(with_ucx: bool = False) -> Any:
-    """Builds (once per process) and returns the native extension module.
+def load_extension(remote: bool = False) -> Any:
+    """Builds (once per process and variant) and returns the native extension.
 
     Args:
-        with_ucx: Build the variant with the remote memory source, compiled
-            against UCX (see :func:`ucx_build_flags`).
+        remote: Build the variant with the remote memory source and every
+            backend of :func:`available_remote_backends` compiled in; the
+            module's ``REMOTE_BACKENDS`` lists them. Variants are named after
+            their backend set, so differently configured builds never share a
+            JIT cache entry.
 
     """
     with _BUILD_LOCK:
-        return _build_extension(with_ucx)
+        return _build_extension(available_remote_backends() if remote else None)
+
+
+def _load_remote_extension(backend: str) -> Any:
+    """Returns the remote variant of the extension, checking it has `backend`."""
+    if backend not in _REMOTE_BACKENDS:
+        raise ValueError(
+            f"Unknown PLE remote memory backend {backend!r}; supported: "
+            f"{', '.join(_REMOTE_BACKENDS)}"
+        )
+    ext = load_extension(remote=True)
+    if backend not in ext.REMOTE_BACKENDS:
+        reason = _REMOTE_BACKENDS[backend].missing() or "not compiled in"
+        raise RuntimeError(
+            f"PLE remote memory backend {backend!r} is not available: {reason}"
+        )
+    return ext
 
 
 @dataclass(frozen=True)
@@ -148,8 +232,13 @@ class PLERemoteOptions:
     """Remote memory source of a :class:`PLEDiskReader`.
 
     Attributes:
-        server: PLE memory server address, ``"host:port"`` or
-            ``"[ipv6]:port"``.
+        server: Memory server address in the backend's format: ``"host:port"``
+            or ``"[ipv6]:port"`` for ``ucx``; ``"loopback"`` optionally
+            followed by ``?fail_after=N&refuse=1&delay_us=D`` for
+            ``loopback``.
+        backend: Transport reaching the server, one of
+            :data:`REMOTE_BACKENDS` or ``"loopback"`` (in-process, for tests);
+            it must be in :func:`available_remote_backends`.
         max_inflight: Remote GETs in flight.
         region_bytes: Size of each region borrowed from the server.
         upload_chunk_bytes: Size of each staged upload read from the files.
@@ -160,6 +249,7 @@ class PLERemoteOptions:
     """
 
     server: str
+    backend: str = "ucx"
     max_inflight: int = 256
     region_bytes: int = 1 << 30
     upload_chunk_bytes: int = 64 << 20
@@ -190,7 +280,9 @@ class PLEDiskReader:
             upload runs in the background (see :meth:`remote_status`).
 
     Raises:
-        RuntimeError: If ``remote`` is set, the server cannot be used and
+        ValueError: If ``remote.backend`` is unknown.
+        RuntimeError: If ``remote.backend`` is not available (its dependency
+            is missing), or the server cannot be used and
             ``remote.fallback_to_disk`` is false.
 
     """
@@ -220,7 +312,10 @@ class PLEDiskReader:
         self._requested_direct = direct_io
         self._warned_fallback = False
         self._bound: tuple[torch.Tensor, ...] | None = None
-        ext = load_extension(with_ucx=remote is not None)
+        if remote is None:
+            ext = load_extension()
+        else:
+            ext = _load_remote_extension(remote.backend)
         self._reader = ext.Reader(
             paths,
             [index[s.path] for s in segments],
@@ -234,6 +329,7 @@ class PLEDiskReader:
             direct_io,
             float(wait_timeout_s),
             remote.server if remote else "",
+            remote.backend if remote else "",
             remote.max_inflight if remote else 1,
             remote.region_bytes if remote else 1,
             remote.upload_chunk_bytes if remote else 1,
