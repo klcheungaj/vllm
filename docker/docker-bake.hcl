@@ -138,6 +138,11 @@ variable "DGX_SPARK_BUILD_BASE_IMAGE" {
   default = "pytorch/manylinuxaarch64-builder:cuda13.0-b8b5f17a7d9ccfc25bbc5cf17b3fcea12964a042"
 }
 
+# GB10 needs CUDA 13; the builder image above must match its major.minor.
+variable "DGX_SPARK_CUDA_VERSION" {
+  default = "13.0.3"
+}
+
 # sm_121 runs the sm_12x family kernels built for 12.0 under CUDA 13.
 variable "DGX_SPARK_CUDA_ARCH_LIST" {
   default = "12.0"
@@ -159,6 +164,7 @@ target "openai-dgx-spark-base" {
   tags      = ["vllm:openai-dgx-spark-base"]
   args = {
     BUILD_BASE_IMAGE     = DGX_SPARK_BUILD_BASE_IMAGE
+    CUDA_VERSION         = DGX_SPARK_CUDA_VERSION
     torch_cuda_arch_list = DGX_SPARK_CUDA_ARCH_LIST
     max_jobs             = DGX_SPARK_MAX_JOBS
     nvcc_threads         = DGX_SPARK_NVCC_THREADS

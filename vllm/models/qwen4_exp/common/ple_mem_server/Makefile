@@ -13,8 +13,11 @@ UCX_LIBS := -L$(UCX_HOME)/lib -Wl,-rpath,$(UCX_HOME)/lib -lucp -luct -lucs -lucm
 else
 UCX_CFLAGS := $(shell pkg-config --cflags ucx 2>/dev/null)
 UCX_LIBS := $(shell pkg-config --libs ucx 2>/dev/null)
+UCX_LIBDIR := $(shell pkg-config --variable=libdir ucx 2>/dev/null)
 ifeq ($(UCX_LIBS),)
 UCX_LIBS := -lucp -luct -lucs -lucm
+else ifneq ($(UCX_LIBDIR),)
+UCX_LIBS += -Wl,-rpath,$(UCX_LIBDIR)
 endif
 endif
 

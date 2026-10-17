@@ -371,7 +371,10 @@ docker buildx bake -f docker/docker-bake.hcl ple-mem-server
 
 - `docker/Dockerfile.dgx_spark` layers on the `vllm-openai` image that
   `docker/Dockerfile` builds for linux/arm64 and CUDA 13 (the
-  `openai-dgx-spark-base` bake target). It adds UCX built by
+  `openai-dgx-spark-base` bake target; `DGX_SPARK_CUDA_VERSION` picks the
+  CUDA 13 release) and refuses a base image built for another CUDA major
+  version; the host needs the Spark's CUDA 13 driver (R580 or newer). It
+  adds UCX built by
   `tools/install_ucx_from_source.sh` (verbs, rdmacm and mlx5, without CUDA
   support, since rows travel through pinned host memory and need no
   GPUDirect RDMA), the RDMA user-space libraries, g++ for the reader's JIT
@@ -419,6 +422,15 @@ docker run --gpus all --ipc=host --network host \
     --engram-config.remote_memory_server 10.0.0.2:18515 \
     --engram-config.remote_token_file /run/ple_mem.token
 ```
+
+The `PLE offload` GitHub workflow (`.github/workflows/ple-offload.yml`)
+runs the PLE tests on a CPU runner (the remote reader over UCX's tcp
+transport), builds and smoke-tests the memory server image, and builds the
+Spark image's UCX stage on a hosted arm64 runner. Building the whole Spark
+image and running the GPU tests in it needs a self-hosted runner on a DGX
+Spark: set the repository variable `DGX_SPARK_RUNNER` to its labels as a
+JSON list, e.g. `["self-hosted", "linux", "ARM64", "dgx-spark"]`. Pull
+requests from forks never run on it.
 
 Host settings the containers cannot make:
 

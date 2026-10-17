@@ -1,0 +1,202 @@
+name: PLE offload
+
+# Tests the Qwen4Exp PLE disk / remote memory offload and builds its two
+# images, docker/Dockerfile.ple_mem_server and docker/Dockerfile.dgx_spark.
+#
+# The full DGX Spark image compiles vLLM for CUDA 13 on arm64, which needs a
+# self-hosted runner on a Spark (GitHub's arm64 runners are too small): set
+# the repository variable DGX_SPARK_RUNNER to its labels as JSON, e.g.
+# ["self-hosted", "linux", "ARM64", "dgx-spark"]. Without it, that job is
+# skipped and the hosted arm64 runner only builds the image's UCX stage.
+
+on:
+  push:
+    paths:
+      - .github/workflows/ple-offload.yml
+      - docker/Dockerfile
+      - docker/Dockerfile.dgx_spark
+      - docker/Dockerfile.ple_mem_server
+      - docker/docker-bake.hcl
+      - tools/install_ucx_from_source.sh
+      - vllm/config/engram.py
+      - vllm/models/qwen4_exp/**
+      - tests/models/qwen4_exp/test_ple*.py
+      - tests/model_executor/model_loader/test_skip_checkpoint_weights.py
+  pull_request:
+    paths:
+      - .github/workflows/ple-offload.yml
+      - docker/Dockerfile
+      - docker/Dockerfile.dgx_spark
+      - docker/Dockerfile.ple_mem_server
+      - docker/docker-bake.hcl
+      - tools/install_ucx_from_source.sh
+      - vllm/config/engram.py
+      - vllm/models/qwen4_exp/**
+      - tests/models/qwen4_exp/test_ple*.py
+      - tests/model_executor/model_loader/test_skip_checkpoint_weights.py
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    name: PLE tests (CPU, UCX over TCP)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+
+      - name: Free disk space for the CUDA wheels
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+
+      - name: Install compilers and RDMA headers
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends \
+            autoconf automake g++ libibverbs-dev librdmacm-dev libtool make \
+            pkg-config
+
+      - name: Build UCX
+        run: |
+          bash tools/install_ucx_from_source.sh "$HOME/ucx"
+          echo "PKG_CONFIG_PATH=$HOME/ucx/lib/pkgconfig" >> "$GITHUB_ENV"
+
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+        with:
+          python-version: '3.12'
+
+      # Precompiled kernels from the upstream commit this branch is based on.
+      - name: Install vLLM
+        run: |
+          git fetch --no-tags https://github.com/vllm-project/vllm main
+          base=$(git merge-base FETCH_HEAD HEAD)
+          uv venv --python 3.12
+          VLLM_USE_PRECOMPILED=1 VLLM_MAIN_CUDA_VERSION=13.0 \
+          VLLM_PRECOMPILED_WHEEL_COMMIT="$base" \
+            uv pip install -e . --torch-backend=cu130
+          uv pip install -c requirements/test/cuda.txt pytest tblib
+
+      - name: Check the UCX backend builds
+        run: |
+          .venv/bin/python -c "import vllm.models.qwen4_exp.common.ple_disk_reader \
+            as r; r.load_extension(remote=True); \
+            assert 'ucx' in r.available_remote_backends()"
+
+      - name: Run PLE tests
+        run: |
+          .venv/bin/python -m pytest -v -rs \
+            tests/models/qwen4_exp/test_ple_disk.py \
+            tests/models/qwen4_exp/test_ple_disk_reader.py \
+            tests/models/qwen4_exp/test_ple_remote_reader.py \
+            tests/model_executor/model_loader/test_skip_checkpoint_weights.py
+          .venv/bin/python -m pytest -v tests/test_config.py \
+            -k "engram_disk or engram_remote"
+
+  ple-mem-server-image:
+    name: Memory server image (x86_64)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Build
+        run: docker buildx bake -f docker/docker-bake.hcl ple-mem-server
+
+      # No RDMA on hosted runners: run the server and the benchmark over UCX's
+      # tcp transport inside the image, checking every row and that the
+      # server rejects out-of-bounds and foreign-region accesses.
+      - name: Smoke test
+        run: |
+          docker run --rm -e UCX_TLS=tcp --entrypoint bash \
+            vllm-ple-mem-server:latest -c '
+              set -e
+              ucx_info -v
+              ple_mem_server --host 127.0.0.1 --port 18515 --allow-tcp \
+                --max-memory 1G 2> /tmp/server.log &
+              server=$!
+              for _ in $(seq 100); do
+                grep -q listening /tmp/server.log && break
+                sleep 0.1
+              done
+              cat /tmp/server.log
+              ple_mem_bench --server 127.0.0.1:18515 --allow-tcp --bytes 64M \
+                --region-bytes 16M --verify --probe --no-sweep \
+                --ping-iters 1000 --step-rows 16,256 --step-iters 200
+              kill "$server"
+              wait "$server"'
+
+  dgx-spark-ucx:
+    name: DGX Spark image, UCX stage (arm64)
+    runs-on: ${{ vars.ARM64_RUNNER || 'ubuntu-24.04-arm' }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Build
+        run: |
+          docker buildx build --platform linux/arm64 \
+            -f docker/Dockerfile.dgx_spark --target ucx-build \
+            -t dgx-spark-ucx-build --load .
+
+      - name: Check UCX and ple_mem_bench
+        run: |
+          docker run --rm dgx-spark-ucx-build bash -c '
+            set -e
+            /opt/ucx/bin/ucx_info -v
+            ls /opt/ucx/lib/ucx/libuct_ib_mlx5.so /opt/ucx/lib/ucx/libuct_rdmacm.so
+            test -x /opt/ple_mem/bin/ple_mem_bench'
+
+  dgx-spark-image:
+    name: DGX Spark image (CUDA 13, GPU tests)
+    # Never run pull requests from forks on the self-hosted Spark.
+    if: >-
+      vars.DGX_SPARK_RUNNER != '' &&
+      (github.event_name != 'pull_request' ||
+       github.event.pull_request.head.repo.full_name == github.repository)
+    runs-on: ${{ fromJSON(vars.DGX_SPARK_RUNNER || '["self-hosted"]') }}
+    timeout-minutes: 720
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+
+      - name: Build
+        env:
+          VLLM_BUILD_COMMIT: ${{ github.sha }}
+        run: docker buildx bake -f docker/docker-bake.hcl dgx-spark
+
+      - name: Check CUDA 13, the GPU and the PLE reader
+        run: |
+          docker run --rm --gpus all --entrypoint python3 vllm:dgx-spark -c "
+          import torch
+          import vllm.models.qwen4_exp.common.ple_disk_reader as r
+          assert torch.version.cuda.startswith('13.'), torch.version.cuda
+          assert torch.cuda.is_available()
+          print(torch.cuda.get_device_name(), torch.cuda.get_device_capability())
+          r.load_extension(remote=True)
+          assert 'ucx' in r.available_remote_backends()
+          "
+
+      # The remote tests build ple_mem_server from the installed package with
+      # make, which the serving image does not need.
+      - name: Run PLE tests on the GPU
+        run: |
+          docker run --rm --gpus all --ipc=host \
+            -v "$PWD/tests:/workspace/tests:ro" \
+            -v "$PWD/requirements/test/cuda.txt:/workspace/test-lock.txt:ro" \
+            -w /workspace --entrypoint bash vllm:dgx-spark -c '
+              set -e
+              apt-get update -y
+              apt-get install -y --no-install-recommends make
+              uv pip install --system -c test-lock.txt pytest tblib
+              python3 -m pytest -p no:cacheprovider -v -rs \
+                tests/models/qwen4_exp/test_ple_disk.py \
+                tests/models/qwen4_exp/test_ple_disk_reader.py \
+                tests/models/qwen4_exp/test_ple_remote_reader.py'

@@ -13,7 +13,8 @@
 #   docker buildx bake -f docker/docker-bake.hcl dgx-spark
 # or with two builds:
 #   docker buildx build --platform linux/arm64 -f docker/Dockerfile \
-#       --target vllm-openai --build-arg torch_cuda_arch_list=12.0 \
+#       --target vllm-openai --build-arg CUDA_VERSION=13.0.3 \
+#       --build-arg torch_cuda_arch_list=12.0 \
 #       --build-arg BUILD_BASE_IMAGE=<aarch64 builder, see docker-bake.hcl> \
 #       --build-arg max_jobs=8 --build-arg nvcc_threads=2 \
 #       -t vllm:openai-dgx-spark-base --load .
@@ -63,6 +64,17 @@ RUN make -C /tmp/ple_mem_server -B UCX_HOME=/opt/ucx OUT=/opt/ple_mem/bin \
 
 #################### vLLM FOR DGX SPARK ####################
 FROM ${BASE_IMAGE} AS vllm-dgx-spark
+
+# GB10 needs CUDA 13 (sm_121 kernels, the Spark's R580+ driver); refuse a
+# base image built for another CUDA major version.
+RUN case "${CUDA_VERSION:-}" in \
+        13.*) ;; \
+        *) echo "BASE_IMAGE is built for CUDA '${CUDA_VERSION:-unknown}';" \
+                "DGX Spark needs CUDA 13" >&2; \
+           exit 1 ;; \
+    esac \
+    && python3 -c "import torch; v = torch.version.cuda or 'none'; \
+        assert v.startswith('13.'), f'torch is built for CUDA {v}, not 13'"
 
 # Build the PLE reader extensions into the image so the first start does
 # not compile them; the build needs no GPU.
