@@ -267,8 +267,10 @@ class Qwen4ExpPLEDiskEmbedding(Qwen4ExpPLEEmbedding):
         self.storage_dtype = self.weight.dtype
         # Rows come from the checkpoint files, so the table is not a parameter.
         del self.weight
-        engram_config = get_current_vllm_config().engram_config or EngramConfig()
-        self.engram_config = engram_config
+        vllm_config = get_current_vllm_config()
+        self.engram_config = vllm_config.engram_config or EngramConfig()
+        # Dummy weights never open the reader; their rows stay zero.
+        self._zero_rows_while_closed = vllm_config.load_config.load_format == "dummy"
         self.row_bytes = self.embedding_dim * self.storage_dtype.itemsize
         self.num_ngram_heads = num_ngram_heads
         self._ids = torch.zeros(
@@ -349,6 +351,9 @@ class Qwen4ExpPLEDiskEmbedding(Qwen4ExpPLEEmbedding):
                 upload_chunk_bytes=config.remote_upload_chunk_bytes,
                 connect_timeout_s=config.remote_connect_timeout_s,
                 fallback_to_disk=config.remote_fallback_to_disk,
+                max_batch_rows=config.remote_max_batch_rows,
+                token_file=config.remote_token_file,
+                allow_insecure_transport=config.remote_allow_insecure_transport,
             )
         self._remote_opened_at = time.monotonic()
         reader = PLEDiskReader(
@@ -398,10 +403,11 @@ class Qwen4ExpPLEDiskEmbedding(Qwen4ExpPLEEmbedding):
             self.reader.hint(rows.ravel())
 
     def check_error(self) -> None:
-        """Raise any I/O failure recorded by the reader."""
+        """Raise any I/O failure recorded by the reader and log remote state
+        changes."""
         if self.reader is None:
             return
-        if self._remote_state in ("connecting", "uploading"):
+        if self._remote_state not in ("disabled", "failed"):
             self._note_remote_status(self.reader.remote_status())
         self.reader.check_error()
 
@@ -425,7 +431,8 @@ class Qwen4ExpPLEDiskEmbedding(Qwen4ExpPLEEmbedding):
                 status["error"],
                 "continuing with SSD reads"
                 if self.engram_config.remote_fallback_to_disk
-                else "SSD fallback is disabled, so reads of uploaded rows fail",
+                else "SSD fallback is disabled, so the worker aborts on its next "
+                "read of an uploaded row",
             )
 
     def log_and_reset_stats(self, interval_s: float) -> None:
@@ -477,6 +484,16 @@ class Qwen4ExpPLEDiskEmbedding(Qwen4ExpPLEEmbedding):
                 ]
         logger.info(fmt, *args)
 
+    def _open_reader(self) -> "PLEDiskReader | None":
+        """Return the reader, or None while dummy weights leave it closed."""
+        if self.reader is None and not self._zero_rows_while_closed:
+            raise RuntimeError(
+                f"PLE disk source of {self.prefix} is not open: the model loader "
+                "did not run load_weights. Use load_format 'auto' or "
+                "'safetensors' with Engram disk_offload."
+            )
+        return self.reader
+
     def start_prefetch(
         self,
         hidden_states: torch.Tensor | None,
@@ -488,18 +505,17 @@ class Qwen4ExpPLEDiskEmbedding(Qwen4ExpPLEEmbedding):
         del hidden_states
         if query_start_loc is None:
             raise ValueError("PLE disk offload requires query_start_loc")
-        if self.reader is None:
-            logger.warning_once(
-                "PLE disk source of %s is not open; using zero rows.", self.prefix
-            )
+        reader = self._open_reader()
+        if reader is None:
             return
         if ngram_ids.data_ptr() != self._ids_uva.data_ptr():
             self._ids_uva[: ngram_ids.shape[0]].copy_(ngram_ids)
         self._num_tokens_uva.copy_(query_start_loc[-1:])
-        self.reader.launch_notify(torch.cuda.current_stream())
+        reader.launch_notify(torch.cuda.current_stream())
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Wait for this step's rows and return them in storage dtype."""
-        if self.reader is not None:
-            self.reader.launch_wait(torch.cuda.current_stream())
+        reader = self._open_reader()
+        if reader is not None:
+            reader.launch_wait(torch.cuda.current_stream())
         return self._staging_uva[: hidden_states.shape[0]]

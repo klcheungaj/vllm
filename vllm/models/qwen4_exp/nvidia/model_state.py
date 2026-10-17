@@ -19,6 +19,9 @@ from vllm.v1.worker.gpu.states import RequestState
 from ..common.ple_disk import Qwen4ExpPLEDiskEmbedding, ple_ngram_row_ids_np
 from .ngram_embedding import Qwen4ExpNGramEmbedding
 
+# Prompt positions hashed per hint, bounding each hint's size.
+_PLE_HINT_TOKENS = 4096
+
 
 class Qwen4ExpModelState(MambaHybridModelState):
     """Add rollback-safe PLE n-gram context to the model inputs."""
@@ -39,22 +42,25 @@ class Qwen4ExpModelState(MambaHybridModelState):
             and engram_config is not None
             and engram_config.disk_offload
         )
+        # Hints only warm the row cache, so they are inert without one.
         self.ple_disk_hints = bool(
             self.ple_disk_offload
             and engram_config is not None
             and engram_config.disk_prefetch_hints
+            and engram_config.disk_row_cache_rows > 0
         )
-        # (embedding, hash parameters) of each disk-offloaded PLE layer.
-        self.ple_disk_layers: list[tuple[Qwen4ExpPLEDiskEmbedding, dict[str, Any]]]
-        self.ple_disk_layers = []
-        self.ple_disk_layers_resolved = False
+        self.ple_disk_layers = (
+            self._find_ple_disk_layers(model) if self.ple_disk_offload else []
+        )
         self.ple_disk_stats_interval_s = (
             engram_config.disk_stats_interval_s
             if engram_config is not None and self.ple_disk_offload
             else 0.0
         )
         self.ple_disk_stats_logged_at = time.monotonic()
-        self.prefill_token_ids: dict[str, np.ndarray] = {}
+        # Prompt ids and the end of the hinted prefix of each request still
+        # having prefill rows to hint.
+        self.ple_hint_requests: dict[str, tuple[np.ndarray, int]] = {}
         if not self.uses_ngram_embedding:
             self.ngram_context_len = 0
             self.ngram_eos_token_id = 0
@@ -96,68 +102,74 @@ class Qwen4ExpModelState(MambaHybridModelState):
         super().add_request(req_index, new_req_data)
         if self.ple_disk_hints:
             assert new_req_data.prefill_token_ids is not None
-            self.prefill_token_ids[new_req_data.req_id] = np.asarray(
-                new_req_data.prefill_token_ids, dtype=np.int64
-            )
+            tokens = np.asarray(new_req_data.prefill_token_ids, dtype=np.int32)
+            self.ple_hint_requests[new_req_data.req_id] = (tokens, 0)
 
     def remove_request(self, req_id: str) -> None:
         super().remove_request(req_id)
-        self.prefill_token_ids.pop(req_id, None)
+        self.ple_hint_requests.pop(req_id, None)
 
-    def _get_ple_disk_layers(
-        self,
+    @staticmethod
+    def _find_ple_disk_layers(
+        model: nn.Module,
     ) -> list[tuple[Qwen4ExpPLEDiskEmbedding, dict[str, Any]]]:
-        if not self.ple_disk_layers_resolved:
-            # Resolved lazily: the hash buffers load after this state exists.
-            for module in self.model.modules():
-                if not isinstance(module, Qwen4ExpNGramEmbedding):
-                    continue
-                embedding = module.ngram_embedding
-                if not isinstance(embedding, Qwen4ExpPLEDiskEmbedding):
-                    continue
-                params = {
-                    "layer_multipliers": module.layer_multipliers.cpu().numpy(),
-                    "ngram_heads_vocab_sizes": (
-                        module.ngram_heads_vocab_sizes.cpu().numpy()
-                    ),
-                    "ngram_heads_offsets": module.ngram_heads_offsets.cpu().numpy(),
-                    "eos_token_id": module.eos_token_id,
-                    "heads_per_ngram": module.heads_per_ngram,
-                }
-                self.ple_disk_layers.append((embedding, params))
-            self.ple_disk_layers_resolved = True
-        return self.ple_disk_layers
+        """Return (embedding, hash parameters) of each disk-offloaded table."""
+        layers = []
+        for module in model.modules():
+            if not isinstance(module, Qwen4ExpNGramEmbedding):
+                continue
+            embedding = module.ngram_embedding
+            if not isinstance(embedding, Qwen4ExpPLEDiskEmbedding):
+                continue
+            params = {
+                "layer_multipliers": module.layer_multipliers.cpu().numpy(),
+                "ngram_heads_vocab_sizes": module.ngram_heads_vocab_sizes.cpu().numpy(),
+                "ngram_heads_offsets": module.ngram_heads_offsets.cpu().numpy(),
+                "eos_token_id": module.eos_token_id,
+                "heads_per_ngram": module.heads_per_ngram,
+            }
+            layers.append((embedding, params))
+        return layers
 
     def _service_ple_disk(self, input_batch: InputBatch) -> None:
         """Surface reader failures and hint upcoming prefill rows.
 
-        Hints cover this step's prefill chunk and the next one of the same
-        length. The CPU prepares a step ahead of the GPU, so these advisory
-        reads overlap earlier compute. Decode rows are left to demand reads.
+        Each prefill step hints the next chunk of the same length, plus the
+        current chunk when no earlier step hinted it. The CPU prepares a step
+        ahead of the GPU, so these advisory reads overlap earlier compute.
+        Decode rows are left to demand reads.
         """
-        layers = self._get_ple_disk_layers()
-        for embedding, _ in layers:
+        for embedding, _ in self.ple_disk_layers:
             embedding.check_error()
         now = time.monotonic()
         elapsed = now - self.ple_disk_stats_logged_at
         if 0 < self.ple_disk_stats_interval_s <= elapsed:
             self.ple_disk_stats_logged_at = now
-            for embedding, _ in layers:
+            for embedding, _ in self.ple_disk_layers:
                 embedding.log_and_reset_stats(elapsed)
         if not self.ple_disk_hints:
             return
         num_reqs = input_batch.num_reqs
         for batch_idx in np.flatnonzero(input_batch.is_prefilling_np[:num_reqs]):
-            tokens = self.prefill_token_ids.get(input_batch.req_ids[batch_idx])
-            if tokens is None:
+            req_id = input_batch.req_ids[batch_idx]
+            hint_state = self.ple_hint_requests.get(req_id)
+            if hint_state is None:
                 continue
+            tokens, hinted_end = hint_state
             start = int(input_batch.num_computed_prefill_tokens_np[batch_idx])
             chunk_len = int(input_batch.num_scheduled_tokens[batch_idx])
             end = min(start + 2 * chunk_len, tokens.shape[0])
-            if start >= end:
-                continue
-            for embedding, params in layers:
-                embedding.hint_rows(ple_ngram_row_ids_np(tokens, start, end, **params))
+            self._hint_prompt_rows(tokens, max(start, hinted_end), end)
+            if end == tokens.shape[0]:
+                del self.ple_hint_requests[req_id]
+            else:
+                self.ple_hint_requests[req_id] = (tokens, max(hinted_end, end))
+
+    def _hint_prompt_rows(self, tokens: np.ndarray, start: int, end: int) -> None:
+        for begin in range(start, end, _PLE_HINT_TOKENS):
+            stop = min(begin + _PLE_HINT_TOKENS, end)
+            for embedding, params in self.ple_disk_layers:
+                embedding.hint_rows(ple_ngram_row_ids_np(tokens, begin, stop, **params))
 
     def _prepare_ngram_context(
         self,

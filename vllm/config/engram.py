@@ -1,15 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from dataclasses import fields
 from typing import TYPE_CHECKING, Literal
 
 import regex as re
 from pydantic import Field, model_validator
 from typing_extensions import Self
 
-from vllm.config.utils import config, get_hash_factors, hash_factors
+from vllm.config.utils import config, get_field, get_hash_factors, hash_factors
 
 if TYPE_CHECKING:
+    from vllm.config.load import LoadConfig
     from vllm.config.model import ModelConfig
     from vllm.config.parallel import ParallelConfig
 
@@ -40,8 +42,13 @@ _DISK_TUNABLE_FIELDS = frozenset(
         "remote_upload_chunk_bytes",
         "remote_connect_timeout_s",
         "remote_fallback_to_disk",
+        "remote_max_batch_rows",
+        "remote_token_file",
+        "remote_allow_insecure_transport",
     }
 )
+# Load formats whose loader never reads a disk-offloaded table.
+_DISK_OFFLOAD_LOAD_FORMATS = ("auto", "hf", "safetensors", "dummy")
 _HOST_PORT_RE = re.compile(r"\[([^\[\]\s]+)\]:(\d{1,5})|([^:\[\]\s]+):(\d{1,5})")
 
 
@@ -153,6 +160,20 @@ class EngramConfig:
     """Keep serving rows from the SSD when the remote memory server cannot be
     reached or fails later; otherwise such a failure is fatal."""
 
+    remote_max_batch_rows: int = Field(default=256, ge=1, le=1024)
+    """Maximum rows requested from the remote memory server in one read
+    request (the protocol allows at most 1024)."""
+
+    remote_token_file: str | None = None
+    """File holding the shared secret the remote memory server expects (its
+    --token-file). The channel is not encrypted, so the token only keeps
+    other clients on a trusted network from borrowing memory."""
+
+    remote_allow_insecure_transport: bool = False
+    """Let the ucx backend use its tcp transport. UCX tcp accepts writes to
+    raw addresses from any peer that reaches the process, so it is refused by
+    default; enable only on an isolated network (e.g. for tests)."""
+
     @model_validator(mode="after")
     def _validate_shared_memory(self) -> Self:
         if self.disk_offload and (self.dp_shared_memory or self.use_thp):
@@ -171,6 +192,17 @@ class EngramConfig:
             _REMOTE_ADDRESS_CHECKS[self.remote_memory_backend](
                 self.remote_memory_backend, self.remote_memory_server
             )
+        else:
+            changed = [
+                f.name
+                for f in fields(self)
+                if f.name.startswith("remote_")
+                and getattr(self, f.name) != get_field(type(self), f.name).default
+            ]
+            if changed:
+                raise ValueError(
+                    f"{', '.join(changed)} only apply with remote_memory_server"
+                )
         return self
 
     def verify_model_config(self, model_config: "ModelConfig | None") -> None:
@@ -204,6 +236,18 @@ class EngramConfig:
             raise ValueError(
                 "Engram disk_offload requires CUDA; the ROCm Qwen4Exp "
                 "implementation does not support it."
+            )
+
+    def verify_load_config(self, load_config: "LoadConfig") -> None:
+        """Reject load formats that would read a disk-offloaded table."""
+        if (
+            self.disk_offload
+            and load_config.load_format not in _DISK_OFFLOAD_LOAD_FORMATS
+        ):
+            raise ValueError(
+                "Engram disk_offload requires a load format that leaves the "
+                f"table unread ({', '.join(_DISK_OFFLOAD_LOAD_FORMATS)}), got "
+                f"load_format={load_config.load_format!r}."
             )
 
     def resolve_dp_shared_memory(self, parallel_config: "ParallelConfig") -> None:
@@ -251,4 +295,7 @@ class EngramConfig:
 
     def compute_hash(self) -> str:
         """Hash settings that affect embedding execution and graph structure."""
-        return hash_factors(get_hash_factors(self, set(_DISK_TUNABLE_FIELDS)))
+        ignored = set(_DISK_TUNABLE_FIELDS)
+        if self.disk_offload:
+            ignored.add("cpu_offload")
+        return hash_factors(get_hash_factors(self, ignored))

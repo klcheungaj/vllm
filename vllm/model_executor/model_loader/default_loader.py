@@ -255,14 +255,21 @@ class DefaultModelLoader(BaseModelLoader):
         self,
         source: Source,
         skip_weight_fn: Callable[[str], bool] | None = None,
+        require_skip: bool = False,
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
         """Get an iterator for the model weights based on the load format.
 
         Args:
             source: The checkpoint to read.
             skip_weight_fn: Optional predicate on prefixed checkpoint names;
-                matching weights are dropped, and the lazy safetensors path
-                never reads them.
+                matching weights are dropped, and the safetensors iterators
+                never read them.
+            require_skip: Fail instead of reading and dropping the skipped
+                weights when the load format cannot leave them unread.
+
+        Raises:
+            ValueError: If ``require_skip`` is set and the load format reads
+                every checkpoint tensor.
 
         """
         extra_config = self.load_config.model_loader_extra_config
@@ -293,6 +300,21 @@ class DefaultModelLoader(BaseModelLoader):
                     f"`{source.model_or_path}`; check language_model prefixes "
                     f"{self._encoder_only_lm_prefixes}"
                 )
+        load_format = self.load_config.load_format
+        if require_skip and (
+            not use_safetensors or load_format in ("fastsafetensors", "instanttensor")
+        ):
+            raise ValueError(
+                f"load_format={load_format!r} reads every checkpoint tensor of "
+                f"{source.model_or_path}, but the model must leave some unread "
+                "(e.g. an Engram disk_offload table); use safetensors files "
+                "with load_format 'auto' or 'safetensors'."
+            )
+        prefixed_skip_fn = (
+            None
+            if skip_weight_fn is None
+            else lambda name: skip_weight_fn(source.prefix + name)
+        )
         if self.load_config.load_format == "npcache":
             # Currently np_cache only support *.bin checkpoints
             assert use_safetensors is False
@@ -322,6 +344,7 @@ class DefaultModelLoader(BaseModelLoader):
                         max_workers=extra_config.get(
                             "num_threads", self.DEFAULT_NUM_THREADS
                         ),
+                        skip_weight_fn=prefixed_skip_fn,
                     )
                 else:
                     weights_iterator = safetensors_weights_iterator(
@@ -335,11 +358,7 @@ class DefaultModelLoader(BaseModelLoader):
                         safetensors_prefetch_block_size=(
                             self.load_config.safetensors_prefetch_block_size
                         ),
-                        skip_weight_fn=(
-                            None
-                            if skip_weight_fn is None
-                            else lambda name: skip_weight_fn(source.prefix + name)
-                        ),
+                        skip_weight_fn=prefixed_skip_fn,
                     )
         else:
             if extra_config.get("enable_multithread_load"):
@@ -379,14 +398,17 @@ class DefaultModelLoader(BaseModelLoader):
             allow_patterns_overrides=getattr(model, "allow_patterns_overrides", None),
         )
         skip_weight_fn = getattr(model, "should_skip_checkpoint_weight", None)
-        yield from self._get_weights_iterator(primary_weights, skip_weight_fn)
+        require_skip = getattr(model, "requires_checkpoint_weight_skip", False)
+        yield from self._get_weights_iterator(
+            primary_weights, skip_weight_fn, require_skip
+        )
 
         secondary_weights = cast(
             Iterable[DefaultModelLoader.Source],
             getattr(model, "secondary_weights", ()),
         )
         for source in secondary_weights:
-            yield from self._get_weights_iterator(source, skip_weight_fn)
+            yield from self._get_weights_iterator(source, skip_weight_fn, require_skip)
 
     def download_model(self, model_config: ModelConfig) -> None:
         self._prepare_weights(

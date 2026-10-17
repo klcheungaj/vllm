@@ -387,6 +387,10 @@ class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
 
         super().__init__()
         self.config = config
+        engram_config = vllm_config.engram_config
+        self.requires_checkpoint_weight_skip = bool(
+            engram_config is not None and engram_config.disk_offload
+        )
         self.model = Qwen4ExpMultiTokenPredictor(
             vllm_config=vllm_config,
             prefix=maybe_prefix(prefix, "mtp"),

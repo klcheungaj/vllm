@@ -417,13 +417,8 @@ class Qwen4ExpModel(nn.Module):
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers, get_layer, prefix=f"{prefix}.layers"
         )
-        # Disk reads have no compute to overlap within the forward pass, so
-        # they are all queued before the first layer.
-        self._forward_start_prefetch_layers = tuple(
-            layer_idx
-            for layer_idx in range(self.start_layer, self.end_layer)
-            if (ple := getattr(self.layers[layer_idx], "ple", None)) is not None
-            and ple.ple_embedding.ngram_embedding.prefetch_at_forward_start
+        self._forward_start_prefetch_layers = self._find_forward_start_prefetch_layers(
+            self.layers, self.start_layer, self.end_layer
         )
         self.is_fused_shared_expert_enabled = is_model_fused_shared_expert_compatible(
             self.layers,
@@ -475,6 +470,21 @@ class Qwen4ExpModel(nn.Module):
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
+
+    @staticmethod
+    def _find_forward_start_prefetch_layers(
+        layers: nn.ModuleList, start_layer: int, end_layer: int
+    ) -> tuple[int, ...]:
+        """Layers whose PLE lookup is queued before the first layer runs.
+
+        Disk reads have no compute to overlap within the forward pass.
+        """
+        return tuple(
+            layer_idx
+            for layer_idx in range(start_layer, end_layer)
+            if (ple := getattr(layers[layer_idx], "ple", None)) is not None
+            and ple.ple_embedding.ngram_embedding.prefetch_at_forward_start
+        )
 
     @staticmethod
     def _start_layer_ple_prefetch(
@@ -717,6 +727,7 @@ class Qwen4ExpForCausalLM(
             and engram_config.disk_offload
             and config.ple_layer_ids
         )
+        self.requires_checkpoint_weight_skip = self.ple_disk_offload
         # A wrapping model opens the disk sources once all of its weights load.
         self.open_ple_disk_sources_after_load = True
         if self.model_config.dtype == torch.bfloat16:
@@ -1016,6 +1027,9 @@ class Qwen4ExpForConditionalGeneration(
         # The weight loader may enter language_model.load_weights once per
         # contiguous run of its checkpoint names.
         self.language_model.open_ple_disk_sources_after_load = False
+        self.requires_checkpoint_weight_skip = (
+            self.language_model.requires_checkpoint_weight_skip
+        )
 
         self.make_empty_intermediate_tensors = (
             self.language_model.make_empty_intermediate_tensors

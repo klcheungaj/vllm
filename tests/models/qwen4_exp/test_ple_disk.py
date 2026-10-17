@@ -11,15 +11,16 @@ import numpy as np
 import pytest
 import torch
 from safetensors.torch import save_file
+from torch import nn
 
 import vllm.model_executor.layers.vocab_parallel_embedding as embedding_module
-import vllm.model_executor.model_loader.weight_utils as weight_utils
 import vllm.model_executor.parameter as parameter_module
 import vllm.models.qwen4_exp.common.ngram_embedding as ngram_embedding_module
 import vllm.models.qwen4_exp.common.ple_disk as ple_disk_module
+import vllm.models.qwen4_exp.nvidia.model as model_module
+import vllm.models.qwen4_exp.nvidia.model_state as model_state_module
+import vllm.models.qwen4_exp.nvidia.ngram_embedding as nvidia_ngram_module
 from vllm.config.engram import EngramConfig
-from vllm.config.load import LoadConfig
-from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
 from vllm.models.qwen4_exp.common.ngram_embedding import (
     Qwen4ExpPLEFp8EmbeddingMethod,
     Qwen4ExpPLEUnquantizedEmbeddingMethod,
@@ -30,9 +31,15 @@ from vllm.models.qwen4_exp.common.ple_disk import (
     is_ple_shard_checkpoint_weight,
     ple_ngram_row_ids_np,
 )
+from vllm.models.qwen4_exp.nvidia.model import (
+    Qwen4ExpForCausalLM,
+    Qwen4ExpForConditionalGeneration,
+    Qwen4ExpModel,
+)
 from vllm.models.qwen4_exp.nvidia.model_state import Qwen4ExpModelState
 from vllm.models.qwen4_exp.nvidia.ngram_embedding import Qwen4ExpNGramEmbedding
 from vllm.utils.platform_utils import is_uva_available
+from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridModelState
 
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 requires_uva = pytest.mark.skipif(
@@ -86,41 +93,96 @@ def test_ple_shard_names_select_only_backbone_table_rows(name, expected):
     assert is_ple_shard_checkpoint_weight(name) is expected
 
 
-def test_loader_never_reads_skipped_weights(tmp_path, monkeypatch):
-    """The model hook keeps skipped tensors from being materialized at all."""
-    save_file(
-        {"kept.weight": torch.ones(2), "skipped.weight": torch.zeros(2)},
-        str(tmp_path / "model.safetensors"),
+def _vllm_config(engram_config: EngramConfig, load_format: str = "auto"):
+    return SimpleNamespace(
+        engram_config=engram_config,
+        load_config=SimpleNamespace(load_format=load_format),
     )
-    read: list[str] = []
-    real_safe_open = weight_utils.safe_open
 
-    class SpySafeOpen:
-        def __init__(self, *args, **kwargs):
-            self._file = real_safe_open(*args, **kwargs)
 
-        def __enter__(self):
-            file = self._file.__enter__()
-            real_get_tensor = file.get_tensor
+def _build_causal_lm(monkeypatch, disk_offload: bool) -> Qwen4ExpForCausalLM:
+    """Run the real constructor with the decoder stack stubbed out."""
+    monkeypatch.setattr(
+        model_module,
+        "Qwen4ExpModel",
+        lambda **kwargs: SimpleNamespace(
+            layers=[], make_empty_intermediate_tensors=None
+        ),
+    )
+    monkeypatch.setattr(model_module, "ParallelLMHead", lambda *args, **kwargs: None)
+    monkeypatch.setattr(model_module, "LogitsProcessor", lambda *args: None)
+    monkeypatch.setattr(
+        model_module, "enable_qwen4_exp_low_latency_gemm", lambda *args: None
+    )
+    monkeypatch.setattr(
+        Qwen4ExpForCausalLM, "set_moe_parameters", lambda self, layers: None
+    )
+    vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            hf_text_config=SimpleNamespace(
+                ple_layer_ids=[2], vocab_size=8, hidden_size=4
+            ),
+            dtype=torch.float16,
+        ),
+        quant_config=None,
+        scheduler_config=None,
+        cache_config=SimpleNamespace(mamba_cache_mode="align"),
+        engram_config=EngramConfig(disk_offload=disk_offload),
+    )
+    return Qwen4ExpForCausalLM(vllm_config=vllm_config)
 
-            def get_tensor(name: str) -> torch.Tensor:
-                read.append(name)
-                return real_get_tensor(name)
 
-            return SimpleNamespace(keys=file.keys, get_tensor=get_tensor)
+@pytest.mark.parametrize("disk_offload", [False, True])
+def test_table_is_skipped_only_under_disk_offload(monkeypatch, disk_offload):
+    """Skipping without disk offload would silently drop the resident table."""
+    causal_lm = _build_causal_lm(monkeypatch, disk_offload)
+    wrapper = Qwen4ExpForConditionalGeneration.__new__(Qwen4ExpForConditionalGeneration)
+    nn.Module.__init__(wrapper)
+    wrapper.language_model = causal_lm
+    shard = f"{_SHARD_NAME}.shard_0.weight"
 
-        def __exit__(self, *exc):
-            return self._file.__exit__(*exc)
+    for model in (causal_lm, wrapper):
+        assert model.should_skip_checkpoint_weight(shard) is disk_offload
+        assert not model.should_skip_checkpoint_weight(f"{_SHARD_NAME}.weight_scale")
+    assert causal_lm.requires_checkpoint_weight_skip is disk_offload
 
-    monkeypatch.setattr(weight_utils, "safe_open", SpySafeOpen)
-    loader = DefaultModelLoader(LoadConfig(load_format="safetensors"))
-    model = SimpleNamespace(should_skip_checkpoint_weight=lambda n: n.startswith("s"))
-    model_config = SimpleNamespace(model=str(tmp_path), revision=None)
 
-    names = [name for name, _ in loader.get_all_weights(model_config, model)]
+@pytest.mark.parametrize("wrapped", [False, True])
+def test_disk_sources_open_once_after_all_weights(monkeypatch, wrapped):
+    """The loader may enter the language model once per run of its names."""
+    opened: list[nn.Module] = []
+    monkeypatch.setattr(
+        model_module,
+        "open_ple_disk_sources",
+        lambda model, vllm_config: opened.append(model),
+    )
 
-    assert names == ["kept.weight"]
-    assert read == ["kept.weight"]
+    class FakeAutoWeightsLoader:
+        def __init__(self, module, **kwargs):
+            self.module = module
+
+        def load_weights(self, weights, mapper=None) -> set[str]:
+            if isinstance(self.module, Qwen4ExpForConditionalGeneration):
+                for _ in range(2):
+                    self.module.language_model.load_weights([])
+            return set()
+
+    monkeypatch.setattr(model_module, "AutoWeightsLoader", FakeAutoWeightsLoader)
+    causal_lm = _build_causal_lm(monkeypatch, disk_offload=True)
+    model: nn.Module = causal_lm
+    if wrapped:
+        model = Qwen4ExpForConditionalGeneration.__new__(
+            Qwen4ExpForConditionalGeneration
+        )
+        nn.Module.__init__(model)
+        model.language_model = causal_lm
+        model.language_model_only = True
+        # As set by Qwen4ExpForConditionalGeneration.__init__.
+        causal_lm.open_ple_disk_sources_after_load = False
+
+    model.load_weights([])
+
+    assert opened == [causal_lm]
 
 
 @pytest.mark.parametrize("ngram_size", [3, 4])
@@ -170,8 +232,11 @@ def test_numpy_row_ids_match_triton_kernel(ngram_size):
     np.testing.assert_array_equal(actual.cpu().numpy(), np.concatenate(expected))
 
 
-def test_prefill_hints_cover_this_and_next_chunk():
-    """Hints span this chunk plus a lookahead chunk, clipped to the prompt."""
+def test_prefill_hints_follow_chunks_preemption_and_prefix_hits(monkeypatch):
+    """Each prompt row is hinted once per request lifetime, a chunk ahead."""
+    monkeypatch.setattr(MambaHybridModelState, "add_request", lambda *args: None)
+    monkeypatch.setattr(MambaHybridModelState, "remove_request", lambda *args: None)
+    monkeypatch.setattr(model_state_module, "_PLE_HINT_TOKENS", 5)
     params = _hash_params(3, heads_per_ngram=2)
     hinted: list[np.ndarray] = []
     errors_checked: list[bool] = []
@@ -182,31 +247,46 @@ def test_prefill_hints_cover_this_and_next_chunk():
     state = Qwen4ExpModelState.__new__(Qwen4ExpModelState)
     state.ple_disk_hints = True
     state.ple_disk_layers = [(embedding, params)]
-    state.ple_disk_layers_resolved = True
     state.ple_disk_stats_interval_s = 0.0
     state.ple_disk_stats_logged_at = 0.0
-    tokens = np.arange(100, 140, dtype=np.int64)
-    state.prefill_token_ids = {"prefill": tokens, "decode": tokens}
-    batch = SimpleNamespace(
-        num_reqs=2,
-        req_ids=["decode", "prefill"],
-        is_prefilling_np=np.array([False, True]),
-        num_computed_prefill_tokens_np=np.array([40, 16], dtype=np.int32),
-        num_scheduled_tokens=np.array([1, 16], dtype=np.int32),
-    )
+    state.ple_hint_requests = {}
+    tokens = np.arange(100, 140)
+    request = SimpleNamespace(req_id="prefill", prefill_token_ids=tokens.tolist())
 
-    state._service_ple_disk(batch)
+    def step(start: int, chunk: int) -> list[np.ndarray]:
+        hinted.clear()
+        state._service_ple_disk(
+            SimpleNamespace(
+                num_reqs=2,
+                req_ids=["decode", "prefill"],
+                is_prefilling_np=np.array([False, True]),
+                num_computed_prefill_tokens_np=np.array([40, start], dtype=np.int32),
+                num_scheduled_tokens=np.array([1, chunk], dtype=np.int32),
+            )
+        )
+        assert all(rows.shape[0] <= 5 for rows in hinted)
+        return hinted
 
-    assert errors_checked == [True]
-    assert len(hinted) == 1
-    np.testing.assert_array_equal(
-        hinted[0], ple_ngram_row_ids_np(tokens, 16, 40, **params)
-    )
+    def rows(start: int, end: int) -> np.ndarray:
+        return ple_ngram_row_ids_np(tokens, start, end, **params)
+
+    state.add_request(0, request)
+    assert state.ple_hint_requests["prefill"][0].dtype == np.int32
+    np.testing.assert_array_equal(np.concatenate(step(0, 8)), rows(0, 16))
+    np.testing.assert_array_equal(np.concatenate(step(8, 8)), rows(16, 24))
+    # Preemption re-adds the request; it resumes from a prefix-cache hit.
+    state.remove_request("prefill")
+    state.add_request(0, request)
+    np.testing.assert_array_equal(np.concatenate(step(16, 8)), rows(16, 32))
+    np.testing.assert_array_equal(np.concatenate(step(24, 16)), rows(32, 40))
+    assert state.ple_hint_requests == {}
+    assert step(40, 1) == []
+    assert len(errors_checked) == 5
 
 
 def _write_checkpoint(path, table: torch.Tensor, missing_shard: int | None = None):
     """Split a table into checkpoint shards across two files plus an index."""
-    shard_size = -(-_NUM_ROWS // _SPLIT_PARTS)
+    shard_size = -(-table.shape[0] // _SPLIT_PARTS)
     files: list[dict[str, torch.Tensor]] = [
         {"model.language_model.embed_tokens.weight": torch.ones(2, 2)},
         {f"{_SHARD_NAME}.weight_scale": torch.tensor([0.5], dtype=torch.bfloat16)},
@@ -250,12 +330,9 @@ def single_rank(monkeypatch):
     for module in (embedding_module, parameter_module):
         monkeypatch.setattr(module, "get_tensor_model_parallel_rank", lambda: 0)
         monkeypatch.setattr(module, "get_tensor_model_parallel_world_size", lambda: 1)
-    engram_config = EngramConfig(disk_offload=True, disk_row_cache_rows=64)
-    monkeypatch.setattr(
-        ple_disk_module,
-        "get_current_vllm_config",
-        lambda: SimpleNamespace(engram_config=engram_config),
-    )
+    vllm_config = _vllm_config(EngramConfig(disk_offload=True, disk_row_cache_rows=64))
+    for module in (ple_disk_module, nvidia_ngram_module):
+        monkeypatch.setattr(module, "get_current_vllm_config", lambda: vllm_config)
 
 
 def _make_disk_embedding(
@@ -403,14 +480,17 @@ class _FakeRemoteReader:
 def remote_embedding(tmp_path, single_rank, monkeypatch):
     import vllm.models.qwen4_exp.common.ple_disk_reader as reader_module
 
-    engram_config = EngramConfig(
-        disk_offload=True, remote_memory_server=_REMOTE_SERVER, remote_max_inflight=32
+    vllm_config = _vllm_config(
+        EngramConfig(
+            disk_offload=True,
+            remote_memory_server=_REMOTE_SERVER,
+            remote_max_inflight=32,
+            remote_max_batch_rows=64,
+            remote_token_file="/etc/ple/token",
+            remote_allow_insecure_transport=True,
+        )
     )
-    monkeypatch.setattr(
-        ple_disk_module,
-        "get_current_vllm_config",
-        lambda: SimpleNamespace(engram_config=engram_config),
-    )
+    monkeypatch.setattr(ple_disk_module, "get_current_vllm_config", lambda: vllm_config)
     monkeypatch.setattr(reader_module, "PLEDiskReader", _FakeRemoteReader)
     embedding, _ = _make_disk_embedding(tmp_path, fp8=False)
     return embedding
@@ -428,33 +508,39 @@ def test_config_backends_match_reader_backends():
 def test_remote_options_reach_reader(remote_embedding):
     from vllm.models.qwen4_exp.common.ple_disk_reader import PLERemoteOptions
 
-    expected = PLERemoteOptions(server=_REMOTE_SERVER, max_inflight=32)
+    expected = PLERemoteOptions(
+        server=_REMOTE_SERVER,
+        max_inflight=32,
+        max_batch_rows=64,
+        token_file="/etc/ple/token",
+        allow_insecure_transport=True,
+    )
     assert remote_embedding.reader.options["remote"] == expected
 
 
 @requires_uva
-@pytest.mark.parametrize(
-    "state, level, message",
-    [
-        ("ready", "INFO", "is ready: uploaded 16.0 GB"),
-        ("failed", "WARNING", "failed: peer gone; continuing with SSD reads"),
-    ],
-)
-def test_remote_transition_logged_once(
-    remote_embedding, caplog_vllm, state, level, message
-):
-    """Steps stop polling the remote status once the upload has settled."""
+def test_remote_failure_after_ready_is_logged_once(remote_embedding, caplog_vllm):
+    """Losing the server after the upload must not go unnoticed."""
     reader = remote_embedding.reader
     remote_embedding.check_error()
-    reader.status.update(state=state, uploaded_bytes=16_000_000_000, error="peer gone")
+    reader.status.update(state="ready", uploaded_bytes=16_000_000_000)
+    for _ in range(3):
+        remote_embedding.check_error()
+    reader.status.update(state="failed", error="peer gone")
     for _ in range(3):
         remote_embedding.check_error()
     polls = reader.status_polls
     remote_embedding.check_error()
 
     assert reader.status_polls == polls
-    records = [r for r in caplog_vllm.records if message in r.getMessage()]
-    assert [r.levelname for r in records] == [level]
+    logged = [
+        (r.levelname, r.getMessage())
+        for r in caplog_vllm.records
+        if "PLE remote memory" in r.getMessage() and "state" not in r.getMessage()
+    ]
+    assert [level for level, _ in logged] == ["INFO", "WARNING"]
+    assert "is ready: uploaded 16.0 GB" in logged[0][1]
+    assert "failed: peer gone; continuing with SSD reads" in logged[1][1]
 
 
 @requires_uva
@@ -468,3 +554,188 @@ def test_remote_stats_report_upload_progress(remote_embedding, caplog_vllm):
     assert "remote uploading: 40 reads" in message
     assert "p50 5 us p99 9 us" in message
     assert "uploaded 4.0 of 16.0 GB" in message
+
+
+@requires_uva
+@pytest.mark.parametrize("load_format", ["auto", "dummy"])
+def test_closed_reader_fails_unless_weights_are_dummy(
+    single_rank, monkeypatch, load_format
+):
+    """A loader that never opened the source must not serve zero rows."""
+    vllm_config = _vllm_config(EngramConfig(disk_offload=True), load_format)
+    monkeypatch.setattr(ple_disk_module, "get_current_vllm_config", lambda: vllm_config)
+    embedding = _make_closed_disk_embedding(f"{_EMBEDDING_PREFIX}.ngram_embedding")
+    ids = embedding.get_prefetch_ids_buffer(_MAX_TOKENS, _NUM_HEADS)[:4]
+    query_start_loc = torch.tensor([0, 4], device="cuda")
+    hidden_states = torch.empty(4, 1, device="cuda")
+
+    if load_format == "dummy":
+        embedding.start_prefetch(None, ids, query_start_loc=query_start_loc)
+        assert not embedding(hidden_states).cpu().any()
+    else:
+        with pytest.raises(RuntimeError, match="is not open"):
+            embedding.start_prefetch(None, ids, query_start_loc=query_start_loc)
+        with pytest.raises(RuntimeError, match="is not open"):
+            embedding(hidden_states)
+
+
+def _make_closed_disk_embedding(prefix: str) -> Qwen4ExpPLEDiskEmbedding:
+    with torch.device("cuda"):
+        return Qwen4ExpPLEDiskEmbedding(
+            _NUM_ROWS,
+            _HEAD_DIM,
+            params_dtype=torch.bfloat16,
+            padding_size=1,
+            prefix=prefix,
+            embedding_method=Qwen4ExpPLEUnquantizedEmbeddingMethod(),
+            num_ngram_heads=_NUM_HEADS,
+            max_total_tokens=_MAX_TOKENS,
+        )
+
+
+class _RecordingReader:
+    def __init__(self, layer_idx: int, events: list[tuple[str, int]]):
+        self.layer_idx = layer_idx
+        self.events = events
+
+    def launch_notify(self, stream) -> None:
+        self.events.append(("notify", self.layer_idx))
+
+    def launch_wait(self, stream) -> None:
+        self.events.append(("wait", self.layer_idx))
+
+
+class _FakePLE(nn.Module):
+    """The prefetch path of Qwen4ExpPLELayer over a disk embedding."""
+
+    def __init__(self, embedding: Qwen4ExpPLEDiskEmbedding):
+        super().__init__()
+        self.ple_embedding = SimpleNamespace(ngram_embedding=embedding)
+
+    def start_prefetch(self, hidden_states, input_ids, query_start_loc, context):
+        embedding = self.ple_embedding.ngram_embedding
+        ids = embedding.get_prefetch_ids_buffer(_MAX_TOKENS, _NUM_HEADS)
+        embedding.start_prefetch(
+            hidden_states, ids[: input_ids.numel()], query_start_loc=query_start_loc
+        )
+
+
+class _FakeDecoderLayer(nn.Module):
+    def __init__(self, layer_idx: int, events, embedding=None):
+        super().__init__()
+        self.layer_idx = layer_idx
+        self.events = events
+        if embedding is not None:
+            self.ple = _FakePLE(embedding)
+
+    def forward(self, hidden_states, **kwargs):
+        if hasattr(self, "ple"):
+            self.ple.ple_embedding.ngram_embedding(hidden_states)
+        self.events.append(("layer", self.layer_idx))
+        return hidden_states, None, None
+
+
+@requires_uva
+def test_forward_notifies_each_disk_layer_once_before_any_wait(
+    single_rank, monkeypatch
+):
+    """A wait without its step's notify would hand the layer stale rows."""
+    events: list[tuple[str, int]] = []
+    layers = []
+    for layer_idx in range(4):
+        embedding = None
+        if layer_idx in (1, 3):
+            embedding = _make_closed_disk_embedding(
+                f"model.layers.{layer_idx}.ple.ple_embedding.ngram_embedding"
+            )
+            embedding.reader = _RecordingReader(layer_idx, events)
+        layers.append(_FakeDecoderLayer(layer_idx, events, embedding))
+    model = Qwen4ExpModel.__new__(Qwen4ExpModel)
+    nn.Module.__init__(model)
+    model.config = SimpleNamespace(hc_count=1)
+    model.layers = nn.ModuleList(layers)
+    model.start_layer, model.end_layer = 0, len(layers)
+    model._forward_start_prefetch_layers = (
+        Qwen4ExpModel._find_forward_start_prefetch_layers(model.layers, 0, 4)
+    )
+    monkeypatch.setattr(
+        model_module,
+        "get_pp_group",
+        lambda: SimpleNamespace(is_first_rank=True, is_last_rank=False),
+    )
+    num_tokens = 6
+
+    model(
+        input_ids=torch.zeros(num_tokens, dtype=torch.int32, device="cuda"),
+        positions=torch.arange(num_tokens, device="cuda"),
+        inputs_embeds=torch.zeros(num_tokens, 8, device="cuda"),
+        query_start_loc=torch.tensor([0, num_tokens], device="cuda"),
+        ngram_context=torch.zeros(1, 2, dtype=torch.int32, device="cuda"),
+    )
+
+    assert events == [
+        ("notify", 1),
+        ("notify", 3),
+        ("layer", 0),
+        ("wait", 1),
+        ("layer", 1),
+        ("layer", 2),
+        ("wait", 3),
+        ("layer", 3),
+    ]
+
+
+@requires_uva
+def test_ngram_module_disk_lookup_replays_under_cuda_graph(tmp_path, single_rank):
+    """Hashing, notify and wait captured together follow new inputs on replay."""
+    eos = 7
+    config = SimpleNamespace(
+        ngram_size=3,
+        heads_per_ngram=2,
+        eos_token_id=eos,
+        vocab_size=1000,
+        split_ngram_parts=_SPLIT_PARTS,
+        seed=1234,
+        ngram_vocab_size_base=200,
+        make_ngram_vocab_size_divisible_by=1,
+    )
+    with torch.device("cuda"):
+        module = Qwen4ExpNGramEmbedding(
+            config,
+            _NUM_HEADS * _HEAD_DIM,
+            ple_dense_layer_id=0,
+            max_total_tokens=_MAX_TOKENS,
+            data_parallel_rank=0,
+            prefix=_EMBEDDING_PREFIX,
+            params_dtype=torch.bfloat16,
+        )
+    table = torch.randn(module.ngram_embedding.org_vocab_size, _HEAD_DIM)
+    table = table.to(torch.bfloat16)
+    _write_checkpoint(tmp_path, table)
+    module.open_disk_source(str(tmp_path))
+    padded_tokens = 16
+    input_ids = torch.zeros(padded_tokens, dtype=torch.int32, device="cuda")
+    query_start_loc = torch.tensor([0, padded_tokens], dtype=torch.int32, device="cuda")
+    ngram_context = torch.full((1, 2), eos, dtype=torch.int32, device="cuda")
+    hidden_states = torch.empty(padded_tokens, 1, device="cuda")
+
+    def lookup() -> torch.Tensor:
+        module.start_prefetch(None, input_ids, query_start_loc, ngram_context)
+        return module(hidden_states, input_ids, query_start_loc, ngram_context)
+
+    lookup()
+    torch.accelerator.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        output = lookup()
+
+    for num_tokens in (padded_tokens, 5):
+        input_ids.copy_(torch.randint(0, 1000, (padded_tokens,)))
+        ngram_context.copy_(torch.randint(0, 1000, (1, 2)))
+        query_start_loc[1] = num_tokens
+        graph.replay()
+        torch.accelerator.synchronize()
+        ids = module.compute_ngram_ids(input_ids, query_start_loc, ngram_context)
+        expected = _expected_rows(table, ids[:num_tokens])
+        assert torch.equal(output[:num_tokens].cpu(), expected)
+    module.ngram_embedding.check_error()

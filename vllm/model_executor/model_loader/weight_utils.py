@@ -956,6 +956,51 @@ def _prefetch_checkpoint(
             pass
 
 
+def _read_safetensors_header(f: IO[bytes]) -> tuple[int, dict[str, Any]]:
+    """Return the data offset and the JSON header of an open safetensors file."""
+    header_len = int.from_bytes(f.read(8), "little")
+    return 8 + header_len, json.loads(f.read(header_len))
+
+
+def _has_skipped_weight(st_file: str, skip_weight_fn: Callable[[str], bool]) -> bool:
+    with open(st_file, "rb") as f:
+        _, header = _read_safetensors_header(f)
+    return any(skip_weight_fn(name) for name in header if name != "__metadata__")
+
+
+def _eager_load_safetensors(
+    st_file: str, skip: Callable[[str], bool]
+) -> dict[str, torch.Tensor]:
+    """Read a safetensors file into memory without reading skipped tensors."""
+    with open(st_file, "rb") as f:
+        data_start, header = _read_safetensors_header(f)
+        kept = {
+            name: info
+            for name, info in header.items()
+            if name == "__metadata__" or not skip(name)
+        }
+        if len(kept) == len(header):
+            f.seek(0)
+            return load(f.read())
+        chunks: list[bytes] = []
+        size = 0
+        tensors = sorted(
+            (name for name in kept if name != "__metadata__"),
+            key=lambda name: kept[name]["data_offsets"][0],
+        )
+        for name in tensors:
+            begin, end = kept[name]["data_offsets"]
+            f.seek(data_start + begin)
+            chunks.append(f.read(end - begin))
+            kept[name] = {**kept[name], "data_offsets": [size, size + end - begin]}
+            size += end - begin
+    kept_header = json.dumps(kept).encode()
+    kept_header += b" " * (-len(kept_header) % 8)
+    blob = b"".join([len(kept_header).to_bytes(8, "little"), kept_header, *chunks])
+    del chunks
+    return load(blob)
+
+
 def _prefetch_all_checkpoints(
     sorted_files: list[str],
     num_prefetch_threads: int = DEFAULT_SAFETENSORS_PREFETCH_NUM_THREADS,
@@ -1046,7 +1091,9 @@ def safetensors_weights_iterator(
     When *local_expert_ids* is provided, expert weights not belonging to
     this rank are skipped **before** reading from disk, which drastically
     reduces storage I/O for MoE models under EP. Names for which
-    *skip_weight_fn* returns true are likewise never read.
+    *skip_weight_fn* returns true are never read by any strategy: eager
+    loading reads only the other tensors of a file, and prefetching leaves out
+    the files that hold such names.
     """
 
     def skip(name: str) -> bool:
@@ -1117,9 +1164,23 @@ def safetensors_weights_iterator(
             avail_bytes / 1024**3,
         )
 
-    if should_prefetch:
+    if should_prefetch and skip_weight_fn is not None:
+        prefetch_files = [
+            st_file
+            for st_file in sorted_files
+            if not _has_skipped_weight(st_file, skip_weight_fn)
+        ]
+        if len(prefetch_files) < len(sorted_files):
+            logger.info_once(
+                "Not prefetching %d checkpoint file(s) holding weights the "
+                "model leaves unread.",
+                len(sorted_files) - len(prefetch_files),
+            )
+    else:
+        prefetch_files = sorted_files
+    if should_prefetch and prefetch_files:
         _prefetch_all_checkpoints(
-            sorted_files,
+            prefetch_files,
             num_prefetch_threads=safetensors_prefetch_num_threads,
             block_size=safetensors_prefetch_block_size,
         )
@@ -1132,8 +1193,7 @@ def safetensors_weights_iterator(
         bar_format=_BAR_FORMAT,
     ):
         if safetensors_load_strategy == "eager":
-            with open(st_file, "rb") as f:
-                state_dict = load(f.read())
+            state_dict = _eager_load_safetensors(st_file, skip)
             for name, param in state_dict.items():
                 if not skip(name):
                     yield name, param
@@ -1180,12 +1240,22 @@ def multi_thread_safetensors_weights_iterator(
     hf_weights_files: list[str],
     use_tqdm_on_load: bool,
     max_workers: int = 4,
+    skip_weight_fn: Callable[[str], bool] | None = None,
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
-    """Multi-Thread iterate over the weights in the model safetensor files."""
+    """Multi-Thread iterate over the weights in the model safetensor files.
+
+    Names for which *skip_weight_fn* returns true are never read.
+    """
 
     def _load_file(st_file: str):
-        result = load_file(st_file, device="cpu")
-        return result
+        if skip_weight_fn is None:
+            return load_file(st_file, device="cpu")
+        with safe_open(st_file, framework="pt") as f:
+            return {
+                name: f.get_tensor(name)
+                for name in f.keys()  # noqa: SIM118
+                if not skip_weight_fn(name)
+            }
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
         # Note to use generator here so we do not store all the loaded files in memory

@@ -1744,8 +1744,19 @@ def test_engram_disk_tunables_keep_compile_hash():
         remote_upload_chunk_bytes=1 << 20,
         remote_connect_timeout_s=1.0,
         remote_fallback_to_disk=False,
+        remote_max_batch_rows=16,
+        remote_token_file="/etc/ple/token",
+        remote_allow_insecure_transport=True,
     )
     assert tuned.compute_hash() == EngramConfig(disk_offload=True).compute_hash()
+
+
+def test_engram_disk_offload_hash_ignores_cpu_offload():
+    """disk_offload overrides cpu_offload, so toggling it must not recompile."""
+    assert (
+        EngramConfig(disk_offload=True, cpu_offload=False).compute_hash()
+        == EngramConfig(disk_offload=True).compute_hash()
+    )
 
 
 @pytest.mark.parametrize(
@@ -1763,6 +1774,8 @@ def test_engram_disk_tunables_keep_compile_hash():
         {"remote_upload_chunk_bytes": (1 << 20) - 1},
         {"remote_connect_timeout_s": 0.0},
         {"remote_memory_backend": "loopback"},
+        {"remote_max_batch_rows": 0},
+        {"remote_max_batch_rows": 1025},
     ],
 )
 def test_engram_disk_offload_rejects_invalid_options(options):
@@ -1789,6 +1802,56 @@ def test_engram_remote_memory_server_requires_disk_offload():
     """The checkpoint files are the upload source and the fallback."""
     with pytest.raises(ValueError, match="requires disk_offload=True"):
         EngramConfig(remote_memory_server="10.0.0.2:18515")
+
+
+@pytest.mark.parametrize(
+    "option",
+    [
+        {"remote_max_inflight": 32},
+        {"remote_token_file": "/etc/ple/token"},
+        {"remote_allow_insecure_transport": True},
+    ],
+)
+def test_engram_remote_options_require_remote_memory_server(option):
+    """A remote knob without a server is a misconfiguration, not a no-op."""
+    with pytest.raises(ValueError, match="only apply with remote_memory_server"):
+        EngramConfig(disk_offload=True, **option)
+
+
+@pytest.mark.parametrize(
+    "load_format, error",
+    [
+        ("auto", False),
+        ("safetensors", False),
+        ("dummy", False),
+        ("fastsafetensors", True),
+        ("sharded_state", True),
+        ("runai_streamer", True),
+    ],
+)
+def test_engram_disk_offload_rejects_load_formats_reading_the_table(
+    monkeypatch, load_format, error
+):
+    monkeypatch.setattr(current_platform, "is_cuda", lambda: True)
+    monkeypatch.setattr(current_platform, "is_cuda_alike", lambda: True)
+    config = cast(
+        VllmConfig,
+        SimpleNamespace(
+            model_config=SimpleNamespace(
+                architecture="Qwen4ExpForCausalLM",
+                hf_text_config=SimpleNamespace(ple_layer_ids=[2]),
+            ),
+            speculative_config=None,
+            engram_config=EngramConfig(disk_offload=True),
+            parallel_config=ParallelConfig(),
+            load_config=LoadConfig(load_format=load_format),
+        ),
+    )
+    if error:
+        with pytest.raises(ValueError, match="leaves the table unread"):
+            VllmConfig._resolve_and_verify_engram_config(config)
+    else:
+        VllmConfig._resolve_and_verify_engram_config(config)
 
 
 @pytest.mark.parametrize(

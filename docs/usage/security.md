@@ -635,6 +635,25 @@ For additional cross-tenant isolation, set `cache_salt` on each request (see [Pr
 - **Single-tenant deployments**: Ensure UUIDs are unique per distinct media content. `cache_salt` is unnecessary when there is no cross-tenant threat.
 - **Default behavior**: Omitting `uuid` entirely preserves the default content-hash-based identity, which is safe against this class of collision but requires hashing the media bytes on every request.
 
+## PLE Memory Server
+
+Engram disk offload for Qwen4Exp can borrow RAM from a standalone PLE memory server (`--engram-config.remote_memory_server`, see [Engram](../features/engram.md#remote-memory-offload)). The server is a network service with no encryption and only optional, shared-secret authentication, so treat it like the other inter-node traffic above: deploy it on an isolated network only.
+
+### Trust Model
+
+- The server can only reach memory the client registered for it (with RDMA, enforced by the NIC through memory keys); it cannot address arbitrary host memory of the vLLM process.
+- The vLLM client does not enable UCX's remote-memory-access feature, whose software handlers would accept arbitrary addresses, and refuses UCX's tcp transport unless `remote_allow_insecure_transport` is set, because UCX's tcp transport accepts writes to arbitrary addresses from any peer that can reach the process. The server likewise refuses tcp unless started with `--allow-tcp`.
+- The protocol is request/response: the server only answers requests, checks that each request stays inside a region the requesting connection borrowed, and enforces memory and region-count limits. vLLM treats any unexpected or malformed reply as a failure of the remote source (falling back to the SSD when `remote_fallback_to_disk` is set).
+- Whoever controls the server, or can observe or tamper with the network, can read the uploaded table and alter the rows the model receives.
+- These guarantees hold against a server that runs this protocol on an unmodified UCX. UCX's own wire protocol trusts its peer (some internal handlers take request identifiers and fragment offsets from the peer without validating them), so a deliberately modified UCX peer may still crash or corrupt the vLLM process. Treat the memory server host as part of the trusted base.
+
+### Recommendations
+
+- Start the server with `--host` set to the address of the RDMA (storage) interface; it has no bind-all default. Firewall its port from everything but the vLLM hosts.
+- Use `--token-file` on the server and `remote_token_file` in vLLM so that other clients on the network cannot borrow memory. The token travels unencrypted and only prevents accidental or unauthorized use on a trusted network.
+- Keep the default limits (`--max-memory auto`, `--max-regions`, `--max-client-regions`) or lower them, so a client cannot exhaust the server's memory.
+- Use `remote_allow_insecure_transport` and `--allow-tcp` only for tests on an isolated host or network.
+
 ## Reporting Security Vulnerabilities
 
 If you believe you have found a security vulnerability in vLLM, please report it following the project's security policy. For more information on how to report security issues and the project's security policy, please see the [vLLM Security Policy](https://github.com/vllm-project/vllm/blob/main/SECURITY.md).

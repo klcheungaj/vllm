@@ -122,7 +122,7 @@ vllm serve <qwen4exp-checkpoint> \
 | `disk_io_threads` | `16` | I/O worker threads. |
 | `disk_max_inflight` | `256` | Maximum outstanding row reads. |
 | `disk_direct_io` | `true` | Read with `O_DIRECT`, falling back to buffered reads where the filesystem does not support it. |
-| `disk_prefetch_hints` | `true` | Prefetch the rows of upcoming prefill chunks while earlier steps run. |
+| `disk_prefetch_hints` | `true` | Prefetch the rows of upcoming prefill chunks into the row cache while earlier steps run; has no effect when the row cache is disabled. |
 | `disk_wait_timeout_s` | `60.0` | Seconds a step waits for its reads before failing. |
 | `disk_stats_interval_s` | `60.0` | Seconds between reader statistics log lines; `0` disables them. |
 
@@ -131,8 +131,24 @@ reports the row-cache hit rate, SSD reads, read latency, and the average time
 each step waited for its rows. Raise the cache until the wait stops shrinking;
 each million rows costs about 160 MB of host memory for an FP8 table.
 
-Only `disk_offload` itself affects the compilation cache; the knobs can be
-retuned without recompiling.
+Only `disk_offload` itself affects the compilation cache; the knobs (and
+`cpu_offload`, which disk offload overrides) can be changed without
+recompiling.
+
+The table must stay unread while the weights load, so `disk_offload`
+requires `--load-format` `auto`, `safetensors` or `dummy` (with which the
+table rows are zeros) and safetensors checkpoint files. Every
+`--safetensors-load-strategy` works: `eager` reads only the other tensors of
+the file holding the table, and `prefetch` leaves that file out of the
+prefetch. Other load formats, such as `fastsafetensors`, `instanttensor`,
+`sharded_state`, `runai_streamer` or `tensorizer`, are rejected at startup.
+
+**Failure handling.** Reads that fail are never replaced with zeros or stale
+rows. If a step's rows cannot be read (an I/O error, a short read, a read
+taking longer than `disk_wait_timeout_s`, or a remote failure with
+`remote_fallback_to_disk` disabled), the worker prints the error to stderr
+and aborts before the step uses the rows, and the engine reports that the
+worker died.
 
 In containers, bind-mount the model directory from a real filesystem (for
 example `-v /models:/models`) rather than reading it through an overlay
@@ -152,27 +168,29 @@ with `dp_shared_memory` and `use_thp`.
 When another machine on the network has spare RAM, disk offload can borrow
 it and serve rows from there instead of from the SSD. The transport is a
 pluggable backend chosen with `remote_memory_backend`; currently `ucx` (RDMA
-such as RoCEv2 or InfiniBand, or TCP, through UCX) is supported:
+such as RoCEv2 or InfiniBand through UCX) is supported:
 
 1. A PLE memory server runs on the machine lending the RAM. It knows nothing
-   about models; it only hands out registered memory regions.
+   about models; it lends plain memory regions and only answers the
+   requests of the clients that borrowed them.
 2. At startup, vLLM connects to it, borrows enough regions for the PLE table,
    and uploads the table from the local checkpoint files in the background.
    Serving starts right away; rows that are not uploaded yet are still read
    from the SSD.
 3. Once uploaded, rows missing from the local row cache are fetched
-   remotely; with UCX over RDMA these are one-sided reads that need no CPU on
-   the server. The row cache
-   (`disk_row_cache_rows`) still applies in front of the remote reads.
+   remotely: vLLM batches them into read requests of up to
+   `remote_max_batch_rows` rows, and the server copies the requested rows
+   into its reply. The row cache (`disk_row_cache_rows`) still applies in
+   front of the remote reads.
 
 The checkpoint files stay the upload source and the fallback: with
 `remote_fallback_to_disk` (the default), vLLM keeps reading from the SSD if
 the server cannot be reached at startup or fails later, for the rest of the
-run.
+run. Without it, a remote failure is fatal: startup fails, or a step that
+needs an uploaded row aborts the worker (see the failure handling above).
 
 Start the memory server first. The `ucx` backend's server is a standalone
-program that depends only
-on UCX, not on vLLM or Python: copy the
+program that depends only on UCX, not on vLLM or Python: copy the
 `vllm/models/qwen4_exp/common/ple_mem_server/` directory to the machine
 lending the RAM and build it with a C++17 compiler and the UCX development
 files:
@@ -180,38 +198,55 @@ files:
 ```bash
 make -C ple_mem_server            # finds UCX with pkg-config
 make -C ple_mem_server UCX_HOME=/opt/ucx   # or from a UCX install prefix
-./ple_mem_server/ple_mem_server --port 18515 --max-memory 64G --hugepages
+./ple_mem_server/ple_mem_server --host 10.0.0.2 --port 18515 \
+  --max-memory 64G --token-file /etc/ple/token --hugepages
 ```
 
 | Server flag | Default | Meaning |
 | --- | --- | --- |
-| `--host` | `0.0.0.0` | Address to listen on. |
+| `--host` | required | Address to listen on: the address of the RDMA (storage) interface. There is no bind-all default. |
 | `--port` | `18515` | Port to listen on. |
-| `--max-memory` | `0` | Maximum bytes lent in total (`K`/`M`/`G`/`T` suffixes); `0` means no limit. |
-| `--busy-poll` | off | Spin instead of sleeping between events; lowers latency of the TCP transport at the cost of a CPU core. |
+| `--max-memory` | `auto` | Maximum bytes lent in total (`K`/`M`/`G`/`T` suffixes); `auto` is 90% of `MemAvailable` at startup. |
+| `--max-regions` | `16384` | Regions lent in total. |
+| `--max-client-regions` | `4096` | Regions lent to one client. |
+| `--token-file` | none | Require the shared secret in this file from clients. |
+| `--allow-tcp` | off | Allow UCX's tcp transport; insecure, see **Security** below. |
+| `--event-wait` | off | Sleep on UCX wakeup events between requests instead of busy-polling; saves a CPU core at the cost of wakeup latency. |
 | `--hugepages` | off | Back regions with transparent huge pages. |
-| `--verbose` | off | Log more detail to stderr. |
+| `--verbose` | off | Log every allocation and release to stderr. |
 
 The same directory builds `ple_mem_bench`, a standalone client that measures
-the link before vLLM uses it: upload bandwidth, large-read bandwidth, and the
-rate and latency (p50/p99/p99.9) of random row-sized reads at several queue
-depths. Run it from the vLLM machine with the same UCX environment:
+the link before vLLM uses it: upload bandwidth; the idle round-trip latency
+of a one-row read; the latency of fetching one step's rows the way the
+reader does (N random rows posted at once as requests of at most
+`--step-batch` rows, timed until the last row arrives); and the rate,
+bandwidth and latency of batched reads across batch sizes and queue depths.
+Run it from the vLLM machine with the same UCX environment:
 
 ```bash
 ./ple_mem_server/ple_mem_bench --server 10.0.0.2:18515 --bytes 4G \
-  --row-bytes 160 --depth 1,16,64,256 --seconds 5
+  --step-rows 128,256,1024 --step-batch 256 \
+  --batch-rows 1,64,256,1024 --depth 1,4,16 --seconds 5 \
+  --token-file /etc/ple/token
 ```
 
-`--verify` checks every read against the uploaded pattern and `--json`
-prints machine-readable results; see the directory's `README.md` for all
-flags.
+A decode step reads about 16 rows per scheduled token (for example 4 users
+with 3 MTP draft tokens: 16 tokens, 256 rows). If the step latency stays
+well below the compute before the PLE layer, remote reads are fully hidden;
+the `PLE disk ...` log line's average wait per step confirms it in vLLM.
+
+`--verify` checks every read against the uploaded pattern, `--probe` checks
+that the server rejects out-of-bounds and foreign-region requests, and
+`--json` prints machine-readable results; see the directory's `README.md`
+for all flags.
 
 Then point vLLM at it:
 
 ```bash
 vllm serve <qwen4exp-checkpoint> \
   --engram-config.disk_offload true \
-  --engram-config.remote_memory_server 10.0.0.2:18515
+  --engram-config.remote_memory_server 10.0.0.2:18515 \
+  --engram-config.remote_token_file /etc/ple/token
 ```
 
 | Field | Default | Meaning |
@@ -219,15 +254,20 @@ vllm serve <qwen4exp-checkpoint> \
 | `remote_memory_server` | `None` | Address of the memory server, `host:port` (or `[ipv6]:port`) for `ucx`; requires `disk_offload`. |
 | `remote_memory_backend` | `ucx` | Transport used to reach the server. |
 | `remote_max_inflight` | `256` | Maximum outstanding remote row reads. |
+| `remote_max_batch_rows` | `256` | Maximum rows in one read request (at most `1024`). |
 | `remote_region_bytes` | `1073741824` | Size of each borrowed memory region. |
 | `remote_upload_chunk_bytes` | `67108864` | Size of each staging buffer used for the upload. |
 | `remote_connect_timeout_s` | `30.0` | Seconds to wait for connecting and borrowing the regions. |
 | `remote_fallback_to_disk` | `true` | Keep reading from the SSD when the server is unreachable or fails; otherwise such a failure is fatal. |
+| `remote_token_file` | `None` | File holding the shared secret of the server's `--token-file`. |
+| `remote_allow_insecure_transport` | `false` | Let UCX use its tcp transport; insecure, see **Security** below. |
 
-Like the disk knobs, these do not affect the compilation cache. vLLM logs
-when the upload completes (size and duration) or when the remote source
-fails, and the periodic `PLE disk ...` line adds remote reads, remote read
-latency, and the upload progress while it runs.
+The other `remote_*` fields are only valid together with
+`remote_memory_server`. Like the disk knobs, they do not affect the
+compilation cache. vLLM logs when the upload completes (size and duration)
+and when the remote source fails, also after it became ready, and the
+periodic `PLE disk ...` line adds remote reads, remote read latency, and the
+upload progress while it runs.
 
 **Backends.** The row reader is a small C++ extension compiled on first use.
 With `remote_memory_server` set, vLLM compiles a variant containing every
@@ -252,12 +292,14 @@ the same variables for vLLM and the server, for example:
 ```bash
 export UCX_NET_DEVICES=mlx5_0:1   # the RDMA device and port to use
 export UCX_IB_GID_INDEX=3         # the RoCEv2 GID of that port (see show_gids)
-export UCX_TLS=rc,tcp
+export UCX_TLS=rc                 # optional; RDMA transports only
 ```
 
-`ucx_info -d` lists the available devices and transports. `UCX_TLS=tcp`
-alone also works, without RDMA hardware, but UCX then emulates the remote
-reads in software: they are slower and need CPU on the server.
+`ucx_info -d` lists the available devices and transports. vLLM and the
+server remove UCX's tcp transport from `UCX_TLS` (and fail if nothing is
+left) unless `remote_allow_insecure_transport` and `--allow-tcp` are set.
+Those make the remote source work without RDMA hardware, which is meant for
+tests on an isolated host or network only.
 
 **Containers.** No `--privileged` flag is needed. Pass the RDMA devices with
 `--device /dev/infiniband`, lift the locked-memory limit with
@@ -267,11 +309,27 @@ containers.
 
 **Memory sizing.** The server must be able to lend the whole table: about
 51 GB for Qwen3.8-Flash-Next, plus a little rounding per region (each region
-holds whole rows). Use `--max-memory` to cap what one server lends.
+holds whole rows). By default it lends at most 90% of the memory available
+when it starts; set `--max-memory` to cap it explicitly, and
+`--max-regions`/`--max-client-regions` to bound the region count.
 
-**Security.** Run the memory server only on a trusted network. It has no
-authentication, UCX traffic is not encrypted, and any peer holding a
-region's remote key can read and write the borrowed memory.
+**Security.** Run the memory server only on a trusted network, bound to the
+RDMA interface. The server can only reach memory the client registered for
+it (with RDMA, enforced by the NIC through memory keys); it cannot address
+arbitrary host memory. The client does not enable UCX's remote-memory-access
+feature, whose software handlers would accept arbitrary addresses, and
+refuses UCX's tcp transport unless `remote_allow_insecure_transport` is set,
+because UCX's tcp transport accepts writes to arbitrary addresses from any
+peer. The server checks that every request stays inside a region of the
+connection that borrowed it, and vLLM drops the connection on any reply it
+did not ask for or that has the wrong size. Traffic is not encrypted: the
+optional token (`--token-file`/`remote_token_file`) only keeps other clients
+on the network from borrowing memory, and anyone who can observe the network
+can read the token and the table. These guarantees assume the server runs
+this protocol on an unmodified UCX: UCX's own wire protocol trusts its peer,
+so a deliberately modified UCX peer may still crash or corrupt the vLLM
+process. See
+[the security guide](../usage/security.md#ple-memory-server) for details.
 
 ## Data-parallel topologies (DeepSeek V4.1)
 
@@ -323,6 +381,9 @@ IPC namespace across the co-located replicas.
   unsupported with elastic expert parallelism.
 - `disk_offload` is Qwen4Exp-only and requires CUDA with TP, DP, and PP sizes
   of 1.
+- `disk_offload` requires the `auto`, `safetensors` or `dummy` load format
+  and safetensors checkpoint files.
 - `remote_memory_server` requires `disk_offload` and a trusted network (the
-  memory server is unauthenticated); the `ucx` backend needs UCX on both
-  machines.
+  traffic is not encrypted and the optional token is a shared secret); the
+  `ucx` backend needs UCX on both machines and RDMA unless the insecure tcp
+  transport is explicitly allowed.
