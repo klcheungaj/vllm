@@ -443,7 +443,11 @@ Container Registry as `ghcr.io/<owner>/vllm-ple-mem-server` and
 `ghcr.io/<owner>/vllm-dgx-spark`, tagged with the short commit and the
 branch name, or with the tag name and `latest` for `v*` tags; pull them
 instead of building, e.g.
-`docker pull ghcr.io/<owner>/vllm-dgx-spark:<branch>`.
+`docker pull ghcr.io/<owner>/vllm-dgx-spark:<branch>`. On a hosted runner,
+which lacks the disk for the build cache and a local copy of the Spark
+image at once, BuildKit pushes the image straight to GHCR as
+`ci-<commit>`, and the job pulls it back for the checks before adding the
+other tags; the build logs the disk usage every minute.
 
 Host settings the containers cannot make:
 

@@ -22,6 +22,7 @@ on:
     tags: ['v*']
     paths:
       - .github/workflows/ple-offload.yml
+      - .github/workflows/scripts/free_disk_space.sh
       - .github/workflows/scripts/push_ghcr_image.sh
       - docker/Dockerfile
       - docker/Dockerfile.dgx_spark
@@ -35,6 +36,7 @@ on:
   pull_request:
     paths:
       - .github/workflows/ple-offload.yml
+      - .github/workflows/scripts/free_disk_space.sh
       - .github/workflows/scripts/push_ghcr_image.sh
       - docker/Dockerfile
       - docker/Dockerfile.dgx_spark
@@ -169,18 +171,22 @@ jobs:
       packages: write
     env:
       SELF_HOSTED: ${{ vars.DGX_SPARK_RUNNER != '' }}
+      # load: build into the local Docker (self-hosted Spark). push: push
+      # straight from BuildKit to GHCR and pull the image back for the
+      # checks, so the hosted runner's disk never holds the build cache and
+      # the image at once. build: pull requests on a hosted runner, which may
+      # not push, only build.
+      MODE: >-
+        ${{ vars.DGX_SPARK_RUNNER != '' && 'load' ||
+        github.event_name == 'pull_request' && 'build' || 'push' }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           fetch-depth: 0
 
       - name: Free disk space
-        if: env.SELF_HOSTED != 'true'
-        run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
-            /opt/hostedtoolcache /usr/local/share/boost /usr/local/.ghcup
-          docker system prune -af
-          df -h /
+        if: env.MODE != 'load'
+        run: bash .github/workflows/scripts/free_disk_space.sh
 
       # A hosted runner (4 cores, 16 GB) cannot compile vLLM's kernels in
       # time, so it takes them from the upstream build of the commit this
@@ -194,6 +200,7 @@ jobs:
           {
             echo "VLLM_MERGE_BASE_COMMIT=$(git merge-base FETCH_HEAD HEAD)"
             echo "VLLM_BUILD_COMMIT=$GITHUB_SHA"
+            echo "CI_IMAGE=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/vllm-dgx-spark:ci-${GITHUB_SHA::12}"
             if [ "$SELF_HOSTED" = true ]; then
               echo "DGX_SPARK_USE_PRECOMPILED=$USE_PRECOMPILED"
             else
@@ -203,13 +210,51 @@ jobs:
             fi
           } >> "$GITHUB_ENV"
 
+      # The docker-container builder can push without first copying the image
+      # into Docker's image store.
+      - name: Set up BuildKit
+        if: env.MODE != 'load'
+        run: docker buildx create --name ple-builder --driver docker-container --use
+
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: echo "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+
       - name: Build
         run: |
-          docker buildx bake -f docker/docker-bake.hcl dgx-spark
-          df -h /
+          root=$(docker info -f '{{.DockerRootDir}}')
+          # Logs the disk usage every minute; its own process group, so that
+          # killing it also ends its sleep, which would hold the log open.
+          setsid bash -c 'while true; do
+            echo "[disk $(date -u +%H:%M:%S)] $(df -h "$1" \
+              | awk "NR == 2 {print \$3 \" used, \" \$4 \" free of \" \$2}")"
+            sleep 60
+          done' disk-monitor "$root" &
+          monitor=$!
+          trap 'kill -- "-$monitor"' EXIT
+          case "$MODE" in
+            load) args=() ;;
+            push) args=(--provenance=false
+                        --set "dgx-spark.output=type=registry"
+                        --set "dgx-spark.tags=$CI_IMAGE") ;;
+            build) args=(--set "dgx-spark.output=type=cacheonly") ;;
+          esac
+          docker buildx bake -f docker/docker-bake.hcl "${args[@]}" dgx-spark
+          df -h "$root"
+
+      - name: Pull the image for the checks
+        if: env.MODE == 'push'
+        run: |
+          docker buildx rm ple-builder
+          docker pull "$CI_IMAGE"
+          docker tag "$CI_IMAGE" vllm:dgx-spark
+          df -h "$(docker info -f '{{.DockerRootDir}}')"
 
       # Hosted runners have no GPU: the checks run on the CPU there.
       - name: Check CUDA 13 and the PLE reader
+        if: env.MODE != 'build'
         run: |
           gpus=()
           if [ "$SELF_HOSTED" = true ]; then gpus=(--gpus all); fi
@@ -234,7 +279,7 @@ jobs:
       # The remote tests build ple_mem_server from the installed package with
       # make, which the serving image does not need.
       - name: Run PLE tests on the GPU
-        if: env.SELF_HOSTED == 'true'
+        if: env.MODE == 'load'
         run: |
           docker run --rm --gpus all --ipc=host \
             -v "$PWD/tests:/workspace/tests:ro" \
@@ -249,14 +294,18 @@ jobs:
                 tests/models/qwen4_exp/test_ple_disk_reader.py \
                 tests/models/qwen4_exp/test_ple_remote_reader.py'
 
+      # Only images that passed the checks get the commit and branch tags; a
+      # pushed image that failed them keeps just its ci-<commit> tag.
       - name: Push to GHCR
         if: github.event_name != 'pull_request'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          echo "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
-          bash .github/workflows/scripts/push_ghcr_image.sh \
-            vllm:dgx-spark vllm-dgx-spark
+          if [ "$MODE" = push ]; then
+            bash .github/workflows/scripts/push_ghcr_image.sh --remote \
+              "$CI_IMAGE" vllm-dgx-spark
+          else
+            bash .github/workflows/scripts/push_ghcr_image.sh \
+              vllm:dgx-spark vllm-dgx-spark
+          fi
 
       # A self-hosted Spark keeps its Docker config between jobs.
       - name: Log out of GHCR
