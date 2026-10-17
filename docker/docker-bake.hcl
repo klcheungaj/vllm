@@ -134,6 +134,12 @@ target "openai-ubuntu2404" {
 #   docker buildx bake -f docker/docker-bake.hcl dgx-spark
 #   docker buildx bake -f docker/docker-bake.hcl ple-mem-server
 
+# The repository the PLE images link to on GitHub Container Registry; set by
+# GitHub Actions.
+variable "GITHUB_REPOSITORY" {
+  default = "vllm-project/vllm"
+}
+
 variable "DGX_SPARK_BUILD_BASE_IMAGE" {
   default = "pytorch/manylinuxaarch64-builder:cuda13.0-b8b5f17a7d9ccfc25bbc5cf17b3fcea12964a042"
 }
@@ -183,6 +189,11 @@ target "dgx-spark" {
   args = {
     max_jobs = DGX_SPARK_MAX_JOBS
   }
+  labels = {
+    "org.opencontainers.image.source"      = "https://github.com/${GITHUB_REPOSITORY}"
+    "org.opencontainers.image.title"       = "vLLM for DGX Spark"
+    "org.opencontainers.image.description" = "vLLM for NVIDIA DGX Spark (CUDA 13) with Qwen4Exp PLE offload to a remote memory server over UCX"
+  }
   tags   = ["vllm:dgx-spark"]
   output = ["type=docker"]
 }
@@ -192,6 +203,12 @@ target "ple-mem-server" {
   context    = "."
   target     = "ple-mem-server"
   platforms  = ["linux/amd64"]
+  labels = {
+    "org.opencontainers.image.source"      = "https://github.com/${GITHUB_REPOSITORY}"
+    "org.opencontainers.image.title"       = "vLLM PLE memory server"
+    "org.opencontainers.image.description" = "Lends RAM over UCX (RDMA) to vLLM hosts offloading the Qwen4Exp PLE n-gram table"
+    "org.opencontainers.image.licenses"    = "Apache-2.0"
+  }
   tags       = ["vllm-ple-mem-server:latest"]
   output     = ["type=docker"]
 }

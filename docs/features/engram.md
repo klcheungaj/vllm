@@ -432,6 +432,13 @@ Spark: set the repository variable `DGX_SPARK_RUNNER` to its labels as a
 JSON list, e.g. `["self-hosted", "linux", "ARM64", "dgx-spark"]`. Pull
 requests from forks never run on it.
 
+Outside pull requests, the workflow pushes the tested images to GitHub
+Container Registry as `ghcr.io/<owner>/vllm-ple-mem-server` and
+`ghcr.io/<owner>/vllm-dgx-spark`, tagged with the short commit and the
+branch name, or with the tag name and `latest` for `v*` tags; pull them
+instead of building, e.g.
+`docker pull ghcr.io/<owner>/vllm-dgx-spark:<branch>`.
+
 Host settings the containers cannot make:
 
 - `UCX_NET_DEVICES`: the Spark's ConnectX-7 appears as several RDMA

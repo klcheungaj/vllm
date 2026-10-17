@@ -8,11 +8,20 @@ name: PLE offload
 # the repository variable DGX_SPARK_RUNNER to its labels as JSON, e.g.
 # ["self-hosted", "linux", "ARM64", "dgx-spark"]. Without it, that job is
 # skipped and the hosted arm64 runner only builds the image's UCX stage.
+#
+# Except for pull requests, the tested images are pushed to GitHub Container
+# Registry as ghcr.io/<owner>/vllm-ple-mem-server and
+# ghcr.io/<owner>/vllm-dgx-spark, tagged with the short commit and the branch
+# name, or with the tag name and `latest` for `v*` tags.
 
 on:
   push:
+    branches: ['**']
+    # Path filters do not apply to tag pushes.
+    tags: ['v*']
     paths:
       - .github/workflows/ple-offload.yml
+      - .github/workflows/scripts/push_ghcr_image.sh
       - docker/Dockerfile
       - docker/Dockerfile.dgx_spark
       - docker/Dockerfile.ple_mem_server
@@ -25,6 +34,7 @@ on:
   pull_request:
     paths:
       - .github/workflows/ple-offload.yml
+      - .github/workflows/scripts/push_ghcr_image.sh
       - docker/Dockerfile
       - docker/Dockerfile.dgx_spark
       - docker/Dockerfile.ple_mem_server
@@ -103,6 +113,9 @@ jobs:
     name: Memory server image (x86_64)
     runs-on: ubuntu-24.04
     timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
@@ -131,6 +144,16 @@ jobs:
                 --ping-iters 1000 --step-rows 16,256 --step-iters 200
               kill "$server"
               wait "$server"'
+
+      - name: Push to GHCR
+        if: github.event_name != 'pull_request'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          bash .github/workflows/scripts/push_ghcr_image.sh \
+            vllm-ple-mem-server:latest vllm-ple-mem-server
+          docker logout ghcr.io
 
   dgx-spark-ucx:
     name: DGX Spark image, UCX stage (arm64)
@@ -162,6 +185,9 @@ jobs:
        github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: ${{ fromJSON(vars.DGX_SPARK_RUNNER || '["self-hosted"]') }}
     timeout-minutes: 720
+    permissions:
+      contents: read
+      packages: write
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -200,3 +226,17 @@ jobs:
                 tests/models/qwen4_exp/test_ple_disk.py \
                 tests/models/qwen4_exp/test_ple_disk_reader.py \
                 tests/models/qwen4_exp/test_ple_remote_reader.py'
+
+      - name: Push to GHCR
+        if: github.event_name != 'pull_request'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          bash .github/workflows/scripts/push_ghcr_image.sh \
+            vllm:dgx-spark vllm-dgx-spark
+
+      # The Spark keeps its Docker config between jobs.
+      - name: Log out of GHCR
+        if: always() && github.event_name != 'pull_request'
+        run: docker logout ghcr.io
