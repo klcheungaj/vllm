@@ -464,6 +464,13 @@ class _FakeRemoteReader:
             "hint_dropped": 0,
             "read_us_p50": 0.0,
             "read_us_p99": 0.0,
+            "demand_us_p50": 21.0,
+            "demand_us_p99": 48.0,
+            "demand_us_max": 70.0,
+            "demand_small_us_p50": 20.0,
+            "demand_small_us_p99": 40.0,
+            "wait_us_p50": 0.0,
+            "wait_us_p99": 12.0,
             "direct_io": True,
             "remote_reads": 40,
             "remote_bytes": 6400,
@@ -488,6 +495,9 @@ def remote_embedding(tmp_path, single_rank, monkeypatch):
             remote_max_batch_rows=64,
             remote_token_file="/etc/ple/token",
             remote_allow_insecure_transport=True,
+            remote_busy_poll=False,
+            disk_wait_spin_us=25.0,
+            disk_inline_plan_rows=64,
         )
     )
     monkeypatch.setattr(ple_disk_module, "get_current_vllm_config", lambda: vllm_config)
@@ -514,8 +524,11 @@ def test_remote_options_reach_reader(remote_embedding):
         max_batch_rows=64,
         token_file="/etc/ple/token",
         allow_insecure_transport=True,
+        busy_poll=False,
     )
     assert remote_embedding.reader.options["remote"] == expected
+    assert remote_embedding.reader.options["wait_spin_us"] == 25.0
+    assert remote_embedding.reader.options["inline_plan_rows"] == 64
 
 
 @requires_uva
@@ -551,6 +564,8 @@ def test_remote_stats_report_upload_progress(remote_embedding, caplog_vllm):
     (message,) = [
         r.getMessage() for r in caplog_vllm.records if "PLE disk" in r.getMessage()
     ]
+    assert "step rows ready p50 21 us p99 48 us max 70 us" in message
+    assert "step wait p50 0 us p99 12 us" in message
     assert "remote uploading: 40 reads" in message
     assert "p50 5 us p99 9 us" in message
     assert "uploaded 4.0 of 16.0 GB" in message

@@ -34,6 +34,8 @@ _DISK_TUNABLE_FIELDS = frozenset(
         "disk_direct_io",
         "disk_prefetch_hints",
         "disk_wait_timeout_s",
+        "disk_wait_spin_us",
+        "disk_inline_plan_rows",
         "disk_stats_interval_s",
         "remote_memory_backend",
         "remote_memory_server",
@@ -45,6 +47,7 @@ _DISK_TUNABLE_FIELDS = frozenset(
         "remote_max_batch_rows",
         "remote_token_file",
         "remote_allow_insecure_transport",
+        "remote_busy_poll",
     }
 )
 # Load formats whose loader never reads a disk-offloaded table.
@@ -128,6 +131,17 @@ class EngramConfig:
     disk_wait_timeout_s: float = Field(default=60.0, gt=0)
     """Seconds a step waits for its disk offload reads before failing."""
 
+    disk_wait_spin_us: float = Field(default=100.0, ge=0)
+    """Microseconds the step's wait spins on the CPU for its rows before
+    sleeping; spinning avoids a thread wake-up on the decode critical path."""
+
+    disk_inline_plan_rows: int = Field(default=1024, ge=0)
+    """Largest step (in rows) whose reads are planned on the latency path: by
+    the busy-polling remote reader thread when there is one, else directly in
+    the CUDA host function that starts the step (which holds up the stream
+    meanwhile). Larger steps (prefill chunks) are planned by a background
+    thread while the step computes; 0 sends every step there."""
+
     disk_stats_interval_s: float = Field(default=60.0, ge=0)
     """Seconds between disk offload reader statistics log lines (row-cache
     hit rate, SSD reads, read latency, per-step wait); 0 disables them."""
@@ -142,8 +156,9 @@ class EngramConfig:
     """Transport used to reach remote_memory_server: "ucx" (RDMA such as
     RoCEv2 or InfiniBand, or TCP, through UCX)."""
 
-    remote_max_inflight: int = Field(default=256, ge=1)
-    """Maximum outstanding row reads from the remote memory server."""
+    remote_max_inflight: int = Field(default=1024, ge=1)
+    """Maximum outstanding row reads from the remote memory server. Prefetch
+    hints use at most half, so a decode step's reads never wait behind them."""
 
     remote_region_bytes: int = Field(default=1 << 30, ge=1 << 20)
     """Size of each memory region borrowed from the remote memory server."""
@@ -168,6 +183,11 @@ class EngramConfig:
     """File holding the shared secret the remote memory server expects (its
     --token-file). The channel is not encrypted, so the token only keeps
     other clients on a trusted network from borrowing memory."""
+
+    remote_busy_poll: bool = True
+    """Keep the remote reader thread polling the transport instead of
+    sleeping, for the lowest decode latency at the cost of one CPU core while
+    vLLM runs."""
 
     remote_allow_insecure_transport: bool = False
     """Let the ucx backend use its tcp transport. UCX tcp accepts writes to

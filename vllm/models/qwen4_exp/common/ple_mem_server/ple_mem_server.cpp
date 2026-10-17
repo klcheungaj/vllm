@@ -9,10 +9,13 @@
 // (FREE_REQ, or by disconnecting). Regions are plain anonymous memory, never
 // registered with UCX, and only this server's handlers touch them after
 // checking that the region belongs to the requesting connection and that the
-// access is in bounds. The server only answers requests; it never initiates
-// a transfer to a client. The context has active messages only (no RMA), and
-// UCX's tcp transport is excluded unless --allow-tcp. Build with the Makefile
-// next to this file (see README.md).
+// access is in bounds. Regions of 2 MiB or more are 2 MiB-aligned and
+// madvised for transparent huge pages (unless --no-hugepages), so random row
+// reads rarely miss the TLB, and a READ_REQ prefetches all of its rows before
+// copying them, so their DRAM accesses overlap. The server only answers
+// requests; it never initiates a transfer to a client. The context has active
+// messages only (no RMA), and UCX's tcp transport is excluded unless
+// --allow-tcp. Build with the Makefile next to this file (see README.md).
 
 #include <ucp/api/ucp.h>
 
@@ -32,6 +35,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <fstream>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -42,6 +46,9 @@
 namespace {
 
 volatile sig_atomic_t g_stop = 0;
+
+constexpr uint64_t kHugePage = uint64_t{2} << 20;
+constexpr uintptr_t kCacheLine = 64;
 
 void on_signal(int) { g_stop = 1; }
 
@@ -78,7 +85,7 @@ struct Options {
   uint64_t max_regions = 16384;
   uint64_t max_client_regions = 4096;
   bool event_wait = false;
-  bool hugepages = false;
+  bool hugepages = true;
   bool verbose = false;
   bool allow_tcp = false;
   std::string token_file;
@@ -104,7 +111,10 @@ void usage(const char* prog) {
       "  --event-wait           sleep on UCX wakeup events between requests\n"
       "                         (saves a core, adds wakeup latency; default\n"
       "                         busy-polls)\n"
-      "  --hugepages            madvise(MADV_HUGEPAGE) on lent regions\n"
+      "  --no-hugepages         back lent regions with 4 KiB pages only (by\n"
+      "                         default regions of 2 MiB or more are 2 MiB-\n"
+      "                         aligned and madvised for transparent huge\n"
+      "                         pages)\n"
       "  --verbose              log every allocation and release\n"
       "  --inject-fault MODE    testing only: short-reply | unsolicited\n",
       prog);
@@ -157,7 +167,9 @@ bool parse_args(int argc, char** argv, Options* o) {
     } else if (a == "--event-wait") {
       o->event_wait = true;
     } else if (a == "--hugepages") {
-      o->hugepages = true;
+      o->hugepages = true;  // the default; kept for old command lines
+    } else if (a == "--no-hugepages") {
+      o->hugepages = false;
     } else if (a == "--verbose") {
       o->verbose = true;
     } else if (a == "--inject-fault" && value(&v)) {
@@ -203,7 +215,24 @@ struct Conn {
   bool authed = false;
   bool checked = false;  // transport lanes verified
   bool closing = false;
+  // Allocations since its last other request, summarized when it ends.
+  uint64_t borrowed = 0, borrowed_bytes = 0, borrowed_huge = 0;
+  double borrow_t0 = 0, populate_s = 0;
 };
+
+double now_s() {
+  using namespace std::chrono;
+  return duration<double>(steady_clock::now().time_since_epoch()).count();
+}
+
+// AnonHugePages of this process, in bytes.
+uint64_t anon_huge_bytes() {
+  std::ifstream f("/proc/self/smaps_rollup");
+  for (std::string line; std::getline(f, line);)
+    if (line.rfind("AnonHugePages:", 0) == 0)
+      return std::strtoull(line.c_str() + 14, nullptr, 10) * 1024;
+  return 0;
+}
 
 struct Event {
   enum Kind { kConnect, kEpError, kDrop } kind;
@@ -332,20 +361,33 @@ class Server {
       }
     }
     if (listener_ == nullptr) return false;
+    if (opt_.hugepages && thp_disabled())
+      log_msg(
+          "transparent huge pages are disabled "
+          "(/sys/kernel/mm/transparent_hugepage/enabled); regions get 4 KiB "
+          "pages");
 
     ucp_listener_attr_t la{};
     la.field_mask = UCP_LISTENER_ATTR_FIELD_SOCKADDR;
     st = ucp_listener_query(listener_, &la);
     if (st != UCS_OK) return fail("ucp_listener_query", st);
     log_msg("listening on %s (max memory %s, %" PRIu64 " regions, %" PRIu64
-            " per client, %s%s%s)",
+            " per client, %s, %s%s%s)",
             sockaddr_str(la.sockaddr).c_str(),
             ple_mem::human_bytes(opt_.max_memory).c_str(), opt_.max_regions,
             opt_.max_client_regions,
             opt_.event_wait ? "event wait" : "busy poll",
+            opt_.hugepages ? "huge pages" : "4 KiB pages",
             token_.empty() ? "" : ", token required",
             opt_.allow_tcp ? ", tcp allowed" : "");
     return true;
+  }
+
+  static bool thp_disabled() {
+    std::ifstream f("/sys/kernel/mm/transparent_hugepage/enabled");
+    std::string mode;
+    std::getline(f, mode);
+    return mode.find("[never]") != std::string::npos;
   }
 
   bool fail(const char* what, ucs_status_t st) {
@@ -433,6 +475,7 @@ class Server {
       self->drop_later(ep, c, false, "request before authentication");
       return UCS_OK;
     }
+    if (type != ple_mem::kAllocReq) self->log_borrow(c);
     if (rndv && type != ple_mem::kWriteReq) {
       self->drop_later(ep, c, false, "unexpected rendezvous message");
       return UCS_OK;
@@ -489,11 +532,6 @@ class Server {
     rep.status = try_alloc(c, req.bytes, &rep.region_id, &err);
     if (rep.status == ple_mem::kOk) {
       rep.bytes = req.bytes;
-      if (opt_.verbose)
-        log_msg("client %" PRIu64 " borrowed region %" PRIu64 " (%" PRIu64
-                " bytes); client total %s",
-                c.id, rep.region_id, req.bytes,
-                ple_mem::human_bytes(c.mapped).c_str());
       queue_reply(ep, &rep, sizeof(rep), "");
       return;
     }
@@ -504,7 +542,8 @@ class Server {
   }
 
   int32_t try_alloc(Conn& c, uint64_t bytes, uint64_t* id, std::string* err) {
-    const uint64_t page = opt_.hugepages ? (uint64_t{2} << 20) : 4096;
+    const bool huge = opt_.hugepages && bytes >= kHugePage;
+    const uint64_t page = huge ? kHugePage : 4096;
     if (bytes == 0) {
       *err = "zero-byte region";
       return ple_mem::kErrInvalid;
@@ -526,25 +565,74 @@ class Server {
              " lent of " + ple_mem::human_bytes(opt_.max_memory) + ")";
       return ple_mem::kErrLimit;
     }
-    void* addr = mmap(nullptr, mapped, PROT_READ | PROT_WRITE,
-                      MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    void* addr = map_aligned(mapped, page);
     if (addr == MAP_FAILED) {
       *err = std::string("mmap failed: ") + std::strerror(errno);
       return ple_mem::kErrSystem;
     }
-    if (opt_.hugepages) madvise(addr, mapped, MADV_HUGEPAGE);
+    if (huge) madvise(addr, mapped, MADV_HUGEPAGE);
+    const uint64_t huge0 = huge ? anon_huge_bytes() : 0;
+    const double t0 = now_s();
     *err = prefault(addr, mapped);
     if (!err->empty()) {
       munmap(addr, mapped);
       return ple_mem::kErrSystem;
     }
+    const double populate_s = now_s() - t0;
+    const uint64_t huge1 = huge ? anon_huge_bytes() : 0;
+    const uint64_t huge_bytes =
+        std::min(mapped, huge1 - std::min(huge0, huge1));
     Region r{next_region_++, c.id, static_cast<uint8_t*>(addr), bytes, mapped};
     regions_[r.id] = r;
     lent_ += mapped;
     c.regions += 1;
     c.mapped += mapped;
+    if (c.borrowed++ == 0) c.borrow_t0 = t0;
+    c.borrowed_bytes += mapped;
+    c.borrowed_huge += huge_bytes;
+    c.populate_s += populate_s;
+    if (opt_.verbose)
+      log_msg("client %" PRIu64 " borrowed region %" PRIu64 " (%" PRIu64
+              " bytes at %p, populated in %.1f ms, %.0f%% huge pages); "
+              "client total %s",
+              c.id, r.id, bytes, addr, populate_s * 1e3,
+              100.0 * double(huge_bytes) / double(mapped),
+              ple_mem::human_bytes(c.mapped).c_str());
     *id = r.id;
     return ple_mem::kOk;
+  }
+
+  // Logs the borrow `c` just finished (its allocations since its last other
+  // request): populating huge regions can take a while, and transparent
+  // huge pages may silently fall back to 4 KiB pages.
+  void log_borrow(Conn& c) {
+    if (c.borrowed == 0) return;
+    log_msg("client %" PRIu64 " borrowed %" PRIu64
+            " regions (%s) in %.1f s, %.1f s of it populating; %.0f%% in "
+            "huge pages",
+            c.id, c.borrowed, ple_mem::human_bytes(c.borrowed_bytes).c_str(),
+            now_s() - c.borrow_t0, c.populate_s,
+            100.0 * double(c.borrowed_huge) / double(c.borrowed_bytes));
+    c.borrowed = c.borrowed_bytes = c.borrowed_huge = 0;
+    c.populate_s = 0;
+  }
+
+  // Maps `bytes` (a multiple of `align`) at an `align`-aligned address: maps
+  // `align` more, then unmaps the unaligned head and the tail.
+  static void* map_aligned(uint64_t bytes, uint64_t align) {
+    const int flags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE;
+    if (align <= 4096)
+      return mmap(nullptr, bytes, PROT_READ | PROT_WRITE, flags, -1, 0);
+    void* p =
+        mmap(nullptr, bytes + align, PROT_READ | PROT_WRITE, flags, -1, 0);
+    if (p == MAP_FAILED) return p;
+    const auto at = reinterpret_cast<uintptr_t>(p);
+    const uintptr_t start = (at + align - 1) & ~uintptr_t(align - 1);
+    if (start > at) munmap(p, start - at);
+    const uintptr_t end = start + bytes;
+    if (at + bytes + align > end)
+      munmap(reinterpret_cast<void*>(end), at + bytes + align - end);
+    return reinterpret_cast<void*>(start);
   }
 
   // Populates the pages so a shortage fails here instead of at access time.
@@ -672,29 +760,31 @@ class Server {
         length != uint64_t{req.count} * sizeof(ple_mem::ReadEntry)) {
       rep.status = ple_mem::kErrInvalid;
     }
+    // Checks every entry and prefetches its row, then gathers the rows, so
+    // the random DRAM accesses overlap instead of missing one by one.
+    rows_.clear();
+    const Region* r = nullptr;
+    for (uint32_t i = 0; rep.status == ple_mem::kOk && i < req.count; ++i) {
+      ple_mem::ReadEntry e;
+      std::memcpy(&e, data + size_t{i} * sizeof(e), sizeof(e));
+      if (r == nullptr || r->id != e.region_id) r = owned(c, e.region_id);
+      if (r == nullptr) {
+        rep.status = ple_mem::kErrNoRegion;
+      } else if (!ple_mem::in_bounds(e.offset, req.row_bytes, r->bytes)) {
+        rep.status = ple_mem::kErrBounds;
+      } else {
+        rows_.push_back(r->addr + e.offset);
+        prefetch(rows_.back(), req.row_bytes);
+      }
+    }
     int buf = -1;
     if (rep.status == ple_mem::kOk) {
       buf = take_buffer(out);
       uint8_t* dst = buffers_[buf].data();
-      const Region* r = nullptr;
-      for (uint32_t i = 0; i < req.count; ++i) {
-        ple_mem::ReadEntry e;
-        std::memcpy(&e, data + size_t{i} * sizeof(e), sizeof(e));
-        if (r == nullptr || r->id != e.region_id) r = owned(c, e.region_id);
-        if (r == nullptr) {
-          rep.status = ple_mem::kErrNoRegion;
-          break;
-        }
-        if (!ple_mem::in_bounds(e.offset, req.row_bytes, r->bytes)) {
-          rep.status = ple_mem::kErrBounds;
-          break;
-        }
-        std::memcpy(dst + size_t{i} * req.row_bytes, r->addr + e.offset,
-                    req.row_bytes);
-      }
+      for (uint32_t i = 0; i < req.count; ++i)
+        std::memcpy(dst + size_t{i} * req.row_bytes, rows_[i], req.row_bytes);
     }
     if (rep.status != ple_mem::kOk) {
-      if (buf >= 0) free_buffers_.push_back(buf);
       reject(c, "read", rep.status);
       queue_reply(ep, &rep, sizeof(rep), "");
       return;
@@ -703,6 +793,13 @@ class Server {
     queue(ep, &rep, sizeof(rep), buf,
           opt_.fault == Fault::kShortReply ? out - 1 : out);
     if (opt_.fault == Fault::kUnsolicited) write_ack(ep, ~0ull, ple_mem::kOk);
+  }
+
+  static void prefetch(const uint8_t* p, uint32_t bytes) {
+    const auto end = reinterpret_cast<uintptr_t>(p) + bytes;
+    for (auto a = reinterpret_cast<uintptr_t>(p) & ~(kCacheLine - 1); a < end;
+         a += kCacheLine)
+      __builtin_prefetch(reinterpret_cast<const void*>(a));
   }
 
   void reject(const Conn& c, const char* what, int32_t status) {
@@ -837,8 +934,9 @@ class Server {
   void drop_conn(ucp_ep_h ep, ucs_status_t status, bool graceful) {
     auto it = conns_.find(ep);
     if (it == conns_.end()) return;
-    const Conn c = std::move(it->second);
+    Conn c = std::move(it->second);
     conns_.erase(it);
+    log_borrow(c);
     log_msg("client %" PRIu64 " (%s) disconnected (%s); releasing %" PRIu64
             " regions, %s",
             c.id, c.peer.c_str(), ucs_status_string(status), c.regions,
@@ -931,6 +1029,7 @@ class Server {
   std::deque<Event> events_;
   std::deque<Receive> receives_;
   std::vector<Reply> replies_;
+  std::vector<const uint8_t*> rows_;  // sources of the READ_REQ being served
   std::vector<std::vector<uint8_t>> buffers_;
   std::vector<int> free_buffers_;
   std::unordered_map<ucp_ep_h, Conn> conns_;

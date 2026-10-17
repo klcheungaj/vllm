@@ -7,8 +7,14 @@
 // available) by a pool of blocking I/O threads. A set-associative row cache
 // keeps rows already fetched. Demand jobs come from `read_rows` (blocking) or
 // from CUDA host functions (`launch_notify` / `launch_wait`) acting on bound
-// pinned buffers, which makes the path CUDA-graph capturable. Hints prefetch
-// into the cache at low priority.
+// pinned buffers, which makes the path CUDA-graph capturable. A notify host
+// function sits on the stream, so it plans only small jobs (up to
+// inline_plan_rows): it hands them to the busy-polling remote thread when
+// there is one (which plans them and posts their reads in one pass), else
+// plans them itself; larger jobs go to a planner thread. The stream's wait
+// spins briefly before sleeping. Hints are planned by the planner thread and
+// prefetch into the cache at low priority, in at most half of the read slots
+// (none when there are fewer than two).
 //
 // Built with remote memory backends (-DPLE_WITH_UCX, -DPLE_WITH_LOOPBACK for
 // in-process tests; any subset), the table can also be uploaded to RAM
@@ -39,6 +45,7 @@
 #include <deque>
 #include <map>
 #include <memory>
+#include <memory_resource>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -73,6 +80,9 @@ constexpr size_t kMaxFiles = 2047;
 constexpr int64_t kMaxInflight = int64_t{1} << 16;
 constexpr int64_t kMaxIoThreads = 1024;
 constexpr int64_t kMaxBatchRows = 1024;
+// Notify jobs up to this many rows (64 tokens: decode steps) also feed the
+// `demand_small_us_*` statistics.
+constexpr size_t kSmallJobRows = 1024;
 
 using ple_remote::now_us;
 
@@ -151,7 +161,9 @@ class RowCache {
 };
 
 // A batch of rows whose bytes land in `dst` (row i at dst + i * row_bytes).
-// `pending` counts the planning step plus every row still being read.
+// `pending` counts the planning step plus every row still being read; `done`
+// publishes that it reached zero (and every row and `failed` before it) to
+// waiters spinning without the mutex.
 struct Job {
   const int64_t* ids = nullptr;
   size_t n = 0;
@@ -160,7 +172,10 @@ struct Job {
   int writers = 0;
   bool cancelled = false;
   bool failed = false;
-  bool waited = false;
+  bool step = false;      // notified by the stream (feeds demand_us_*)
+  bool recorded = false;  // its latency is in the statistics
+  double t0 = 0;          // demand start (us)
+  std::atomic<bool> done{false};
 };
 using JobPtr = std::shared_ptr<Job>;
 
@@ -186,6 +201,7 @@ struct PageRead {
   bool started = false;
   bool finished = false;
   bool demand = false;
+  bool hint_slot = false;  // started as a hint, counted against the hint cap
   std::vector<Use> uses;
   std::atomic<uint32_t> refs{0};
   ReadPool* pool = nullptr;
@@ -246,7 +262,7 @@ class ReadPool {
     p->uses.clear();
     p->key = p->offset = 0;
     p->file = p->length = 0;
-    p->remote = p->started = p->finished = p->demand = false;
+    p->remote = p->started = p->finished = p->demand = p->hint_slot = false;
     std::lock_guard<std::mutex> lk(mu_);
     free_.push_back(p);
   }
@@ -264,7 +280,6 @@ inline void ReadPtr::reset() {
 
 struct Miss {
   uint64_t key;
-  uint64_t page_key;
   uint64_t row;
   uint64_t offset;  // aligned page offset
   uint32_t in_page;
@@ -341,11 +356,18 @@ class Core {
        int64_t remote_region_bytes, int64_t remote_upload_chunk_bytes,
        double remote_connect_timeout_s, bool remote_fallback_to_disk,
        int64_t remote_max_batch_rows, const std::string& remote_token_file,
-       bool remote_allow_insecure_transport)
+       bool remote_allow_insecure_transport, bool remote_busy_poll,
+       double wait_spin_us, int64_t inline_plan_rows)
       : rb_(static_cast<uint32_t>(row_bytes)),
-        timeout_us_(wait_timeout_s * 1e6) {
+        timeout_us_(wait_timeout_s * 1e6),
+        wait_spin_us_(wait_spin_us),
+        inline_plan_rows_(
+            static_cast<uint64_t>(std::max<int64_t>(0, inline_plan_rows))) {
     if (row_bytes <= 0 || row_bytes > static_cast<int64_t>(kPage))
       throw std::invalid_argument("row_bytes must be in [1, 4096]");
+    if (!(wait_spin_us >= 0) || inline_plan_rows < 0)
+      throw std::invalid_argument(
+          "wait_spin_us and inline_plan_rows must be >= 0");
     if (io_threads <= 0 || io_threads > kMaxIoThreads || max_inflight <= 0 ||
         max_inflight > kMaxInflight || cache_rows < 0)
       throw std::invalid_argument(
@@ -389,6 +411,8 @@ class Core {
           std::max<uint64_t>(1, uint64_t(remote_upload_chunk_bytes) / rb_);
       p.connect_timeout_s = remote_connect_timeout_s;
       p.fallback_to_disk = remote_fallback_to_disk;
+      p.busy_poll = remote_busy_poll;
+      rhint_cap_ = p.max_inflight / 2;
     }
     const size_t ns = seg_file.size();
     if (seg_offset.size() != ns || seg_row_start.size() != ns ||
@@ -432,6 +456,7 @@ class Core {
       fds_.push_back(fd);
     }
     slots_ = static_cast<uint32_t>(max_inflight);
+    hint_cap_ = static_cast<uint32_t>(std::min(io_threads, max_inflight) / 2);
     void* slab = nullptr;
     if (posix_memalign(&slab, kPage, size_t{slots_} * 2 * kPage) != 0) {
       close_fds();
@@ -475,7 +500,7 @@ class Core {
           for (auto& u : r->uses) {
             if (!u.job) continue;
             u.job->failed = true;
-            --u.job->pending;
+            finish_pending_locked(u.job.get(), 1);
           }
           r->uses.clear();
         }
@@ -483,9 +508,14 @@ class Core {
       }
       for (auto& j : plan_q_) {
         j->failed = true;
-        --j->pending;
+        finish_pending_locked(j.get(), 1);
       }
       plan_q_.clear();
+      if (mail_job_) {
+        mail_job_->failed = true;
+        finish_pending_locked(mail_job_.get(), 1);
+        mail_job_.reset();
+      }
       hint_inbox_.clear();
       inflight_.clear();
       bound_job_.reset();
@@ -513,8 +543,10 @@ class Core {
     }
     plan(job.get(), job);
     std::unique_lock<std::mutex> lk(mu_);
-    if (!wait_job(job, lk))
-      throw std::runtime_error("PLE disk read timed out: " + error_);
+    const double t0 = now_us();
+    const bool ok = wait_job(job, lk);
+    stats_.demand_wait_us += now_us() - t0;
+    if (!ok) throw std::runtime_error("PLE disk read timed out: " + error_);
     if (job->failed)
       throw std::runtime_error("PLE disk read failed: " + error_);
   }
@@ -555,7 +587,10 @@ class Core {
       const bool done = cv_done_.wait_for(
           lk, std::chrono::microseconds(static_cast<int64_t>(timeout_us_)),
           [&] { return job->pending == 0 || closed_; });
-      if (!done || job->pending != 0) cancel_locked(job, lk);
+      if ((!done || job->pending != 0) && !cancel_locked(job, lk))
+        throw std::runtime_error(
+            "PLE disk reader: the previous demand job is still being "
+            "written; cannot rebind");
       bound_job_.reset();
     }
     bound_ids_ = reinterpret_cast<const int64_t*>(ids);
@@ -595,7 +630,7 @@ class Core {
 
   py::dict stats() {
     Stats s;
-    std::vector<float> lat, rlat;
+    std::vector<float> lat, rlat, dlat, slat, wlat;
     bool direct;
     uint64_t capacity, requests;
     {
@@ -603,6 +638,9 @@ class Core {
       s = stats_;
       lat = latency_.v;
       rlat = remote_latency_.v;
+      dlat = demand_latency_.v;
+      slat = demand_small_latency_.v;
+      wlat = wait_latency_.v;
       direct = direct_;
       capacity = cache_.capacity();
       requests = remote_.requests.load() - requests_base_;
@@ -630,6 +668,13 @@ class Core {
     d["remote_read_us_p50"] = percentile(rlat, 0.5);
     d["remote_read_us_p99"] = percentile(rlat, 0.99);
     d["remote_requeued"] = s.remote_requeued;
+    d["demand_us_p50"] = percentile(dlat, 0.5);
+    d["demand_us_p99"] = percentile(dlat, 0.99);
+    d["demand_us_max"] = percentile(dlat, 1.0);
+    d["demand_small_us_p50"] = percentile(slat, 0.5);
+    d["demand_small_us_p99"] = percentile(slat, 0.99);
+    d["wait_us_p50"] = percentile(wlat, 0.5);
+    d["wait_us_p99"] = percentile(wlat, 0.99);
     return d;
   }
 
@@ -638,6 +683,10 @@ class Core {
     stats_ = Stats{};
     latency_.clear();
     remote_latency_.clear();
+    demand_latency_.clear();
+    demand_small_latency_.clear();
+    wait_latency_.clear();
+    counters_ = Counters{};
     requests_base_ = remote_.requests.load();
   }
 
@@ -677,26 +726,33 @@ class Core {
   bool closed_locked() const { return closed_; }
 
   ReadPtr pop_remote_read_locked() {
-    ReadPtr r = pop_read_locked(rdemand_q_, rhint_q_);
-    if (r) r->started = true;
+    ReadPtr r =
+        pop_read_locked(rdemand_q_, rhint_q_, rhint_inflight_ < rhint_cap_);
+    if (r) start_read_locked(*r, &rhint_inflight_, &counters_.remote_hint_peak);
     return r;
   }
 
   bool remote_reads_queued_locked() const {
-    return !rdemand_q_.empty() || !rhint_q_.empty();
+    return !rdemand_q_.empty() ||
+           (!rhint_q_.empty() && rhint_inflight_ < rhint_cap_);
   }
 
   // Delivers a batch of remote rows with two lock acquisitions in total.
-  void complete_remote_reads(
+  // Returns true when it freed a hint slot that queued hints wait for.
+  bool complete_remote_reads(
       std::vector<ple_remote::Delivered<ReadPtr>>& batch) {
     std::unique_lock<std::mutex> lk(mu_);
+    const bool capped = rhint_inflight_ >= rhint_cap_;
     for (auto& d : batch) {
       PageRead& r = *d.read;
       auto it = inflight_.find(r.key);
       if (it != inflight_.end() && it->second == d.read) inflight_.erase(it);
       r.finished = true;
+      end_hint_slot_locked(r, &rhint_inflight_);
       mark_live_locked(r.uses);
     }
+    const bool hints_ready =
+        capped && rhint_inflight_ < rhint_cap_ && !rhint_q_.empty();
     lk.unlock();
     for (auto& d : batch) {
       for (const Use& u : d.read->uses)
@@ -713,6 +769,30 @@ class Core {
     }
     lk.unlock();
     if (notify) cv_done_.notify_all();
+    return hints_ready;
+  }
+
+  void open_mailbox() {
+    std::lock_guard<std::mutex> lk(mu_);
+    mailbox_open_ = true;
+  }
+
+  void plan_mailed() { plan_safely(take_mail(false)); }
+
+  void close_mailbox() { plan_safely(take_mail(true)); }
+
+  py::dict debug_counters() {
+    std::lock_guard<std::mutex> lk(mu_);
+    py::dict d;
+    d["inline_plans"] = counters_.inline_plans;
+    d["mailbox_plans"] = counters_.mailbox_plans;
+    d["planner_plans"] = counters_.planner_plans;
+    d["wait_sleeps"] = counters_.wait_sleeps;
+    d["disk_hint_peak"] = counters_.disk_hint_peak;
+    d["remote_hint_peak"] = counters_.remote_hint_peak;
+    d["disk_hint_cap"] = hint_cap_;
+    d["remote_hint_cap"] = rhint_cap_;
+    return d;
   }
 
   void requeue_remote_reads(const std::vector<ReadPtr>& reads) {
@@ -776,6 +856,8 @@ class Core {
     bool entered_ = false;
   };
 
+  // A notify that throws fails its job (plan()'s guard settles the planning
+  // step), so the stream's wait fails closed right away.
   static void notify_cb(void* p) {
     auto* core = static_cast<Core*>(p);
     try {
@@ -784,6 +866,7 @@ class Core {
       std::lock_guard<std::mutex> lk(core->mu_);
       core->set_error_locked(std::string("PLE demand notify failed: ") +
                              e.what());
+      if (core->bound_job_) core->bound_job_->failed = true;
     }
   }
   static void wait_cb(void* p) {
@@ -795,43 +878,110 @@ class Core {
     }
   }
 
-  // Starts the demand job for the bound buffers. A job notified earlier and
-  // never waited is cancelled first, so it cannot write the buffers anymore.
+  // Starts the demand job for the bound buffers. It runs on the stream, so
+  // it plans (cache lookups and queueing, no I/O) only jobs of up to
+  // inline_plan_rows rows, and only without a busy-polling remote thread to
+  // mail them to; larger jobs go to the planner thread. A job notified
+  // earlier and never waited is cancelled first, so it cannot write the
+  // buffers anymore.
   void on_notify() {
+    const double t0 = now_us();
+    ApiCall call(*this, false);
+    JobPtr job;
+    enum { kInline, kMailbox, kPlanner } route;
     {
       std::unique_lock<std::mutex> lk(mu_);
-      if (closed_ || bound_ids_ == nullptr) return;
-      if (bound_job_) cancel_locked(bound_job_, lk);
+      if (!call.entered() || closed_ || bound_ids_ == nullptr) return;
+      if (bound_job_ && !cancel_locked(bound_job_, lk)) {
+        lk.unlock();
+        return fail_stream(
+            "PLE demand notify: the previous job is still being written");
+      }
       const int64_t n =
           std::clamp<int64_t>(*bound_num_tokens_, 0, bound_max_tokens_);
-      auto job = std::make_shared<Job>();
+      job = std::make_shared<Job>();
       job->ids = bound_ids_;
       job->n = static_cast<size_t>(n * bound_heads_);
       job->dst = bound_out_;
+      job->step = true;
+      job->t0 = t0;
       bound_job_ = job;
       bound_last_ = job;
       ++stats_.demand_jobs;
-      plan_q_.push_back(std::move(job));
+      if (job->n > inline_plan_rows_) {
+        route = kPlanner;
+        ++counters_.planner_plans;
+        plan_q_.push_back(job);
+      } else if (mailbox_open_) {
+        route = kMailbox;
+        ++counters_.mailbox_plans;
+        if (mail_job_) {  // cancelled above, never planned
+          finish_pending_locked(mail_job_.get(), 1);
+          cv_done_.notify_all();
+        }
+        mail_job_ = job;
+        remote_.mail.store(true, std::memory_order_release);
+        remote_.kick.fetch_add(1);
+      } else {
+        route = kInline;
+        ++counters_.inline_plans;
+      }
     }
-    cv_plan_.notify_one();
+    if (route == kPlanner) {
+      cv_plan_.notify_one();
+    } else if (route == kMailbox) {
+      remote_.wake();
+    } else {
+      plan(job.get(), job, /*on_stream=*/true);
+    }
   }
 
-  // Blocks the stream until the job of the matching notify completed. The
-  // stream must not run on with missing or stale rows, so a wait without a
-  // fresh notify, a failed job or a timeout fails closed (fail_stream). A
-  // reader closed by its owner just lets the stream go.
+  // Takes the mailed job (closing the mailbox when `close`).
+  JobPtr take_mail(bool close) {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (close) mailbox_open_ = false;
+    remote_.mail.store(false, std::memory_order_relaxed);
+    return std::move(mail_job_);
+  }
+
+  // Plans a demand job off the stream; an error fails the job (plan()'s
+  // guard) and is recorded.
+  void plan_safely(const JobPtr& job) {
+    if (!job) return;
+    try {
+      plan(job.get(), job);
+    } catch (const std::exception& e) {
+      std::lock_guard<std::mutex> lk(mu_);
+      set_error_locked(std::string("PLE demand planning failed: ") + e.what());
+    }
+  }
+
+  // Blocks the stream until the job of the matching notify completed:
+  // spins up to wait_spin_us, then sleeps. The stream must not run on with
+  // missing or stale rows, so a wait without a fresh notify, a failed job or
+  // a timeout fails closed (fail_stream). A reader closed by its owner just
+  // lets the stream go.
   void on_wait() {
-    std::unique_lock<std::mutex> lk(mu_);
-    if (closed_) return;
-    JobPtr job = std::move(bound_job_);
-    bound_job_.reset();
-    if (!job) {
-      lk.unlock();
+    const double t0 = now_us();
+    JobPtr job;
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      if (closed_) return;
+      job = std::move(bound_job_);
+      bound_job_.reset();
+    }
+    if (!job)
       return fail_stream(
           "PLE demand wait without a matching notify (the bound rows are "
           "stale)");
-    }
+    spin_until_done(*job, t0 + wait_spin_us_);
+    std::unique_lock<std::mutex> lk(mu_);
+    if (closed_) return;
+    if (!job->done.load(std::memory_order_relaxed)) ++counters_.wait_sleeps;
     const bool ok = wait_job(job, lk);
+    const double waited = now_us() - t0;
+    wait_latency_.add(waited);
+    stats_.demand_wait_us += waited;
     if (closed_ || (ok && !job->failed)) return;
     const std::string err = error_.empty() ? "PLE disk read failed" : error_;
     lk.unlock();
@@ -853,27 +1003,40 @@ class Core {
   }
 
   // Lock held. Stops late reads from writing `job`'s buffer and waits for
-  // the ones writing it now.
-  void cancel_locked(const JobPtr& job, std::unique_lock<std::mutex>& lk) {
+  // the ones writing it now (copies, so microseconds). Returns false, with
+  // an error recorded, if they are still writing after the wait timeout:
+  // the buffer cannot be reused then.
+  bool cancel_locked(const JobPtr& job, std::unique_lock<std::mutex>& lk) {
     job->cancelled = true;
     job->failed = true;
-    cv_done_.wait(lk, [&] { return job->writers == 0; });
+    record_step_locked(*job);
+    if (cv_done_.wait_for(
+            lk, std::chrono::microseconds(static_cast<int64_t>(timeout_us_)),
+            [&] { return job->writers == 0; }))
+      return true;
+    set_error_locked("PLE demand job still being written after " +
+                     std::to_string(timeout_us_ / 1e6) + " s");
+    return false;
+  }
+
+  // Lock held. Adds a step job's latency (so far, when cancelled) once.
+  void record_step_locked(Job& job) {
+    if (!job.step || job.recorded) return;
+    job.recorded = true;
+    const double us = now_us() - job.t0;
+    demand_latency_.add(us);
+    if (job.n <= kSmallJobRows) demand_small_latency_.add(us);
   }
 
   // Waits (lock held) for `job` to finish. When the reader closes first, the
   // job is cancelled and failed. On timeout records an error, cancels the job
   // so late reads no longer touch its buffer, and returns false.
   bool wait_job(const JobPtr& job, std::unique_lock<std::mutex>& lk) {
-    const double t0 = now_us();
     const bool ok = cv_done_.wait_for(
         lk, std::chrono::microseconds(static_cast<int64_t>(timeout_us_)),
         [&] { return job->pending == 0 || closed_; });
-    stats_.demand_wait_us += now_us() - t0;
     if (job->pending == 0) return true;
-    if (ok) {
-      cancel_locked(job, lk);
-      return true;
-    }
+    if (ok) return cancel_locked(job, lk);
     ++stats_.timeouts;
     set_error_locked("PLE disk read timed out after " +
                      std::to_string(timeout_us_ / 1e6) + " s");
@@ -881,23 +1044,37 @@ class Core {
     return false;
   }
 
+  // Spins without the mutex until `job` is done or `until` (us) passed.
+  static void spin_until_done(const Job& job, double until) {
+    for (uint32_t i = 1; !job.done.load(std::memory_order_acquire); ++i) {
+      if (i % 32 == 0 && now_us() >= until) return;
+      ple_remote::cpu_relax();
+    }
+  }
+
   void set_error_locked(const std::string& msg) {
     ++stats_.errors;
     if (error_.empty()) error_ = msg;
   }
 
+  // Plans the demand jobs too large to plan on the stream, then hints.
   void planner_loop() {
     std::unique_lock<std::mutex> lk(mu_);
     for (;;) {
       cv_plan_.wait(lk, [&] {
-        return closed_ || !plan_q_.empty() || !hint_inbox_.empty();
+        return closed_ || worker_wakes_ > 0 || !plan_q_.empty() ||
+               !hint_inbox_.empty();
       });
       if (closed_) return;
-      if (!plan_q_.empty()) {
+      if (worker_wakes_ > 0) {
+        const size_t n = std::exchange(worker_wakes_, 0);
+        lk.unlock();
+        notify_workers(n);
+      } else if (!plan_q_.empty()) {
         JobPtr job = std::move(plan_q_.front());
         plan_q_.pop_front();
         lk.unlock();
-        plan(job.get(), job);
+        plan_safely(job);
       } else {
         std::vector<int64_t> ids = std::move(hint_inbox_.front());
         hint_inbox_.pop_front();
@@ -906,29 +1083,61 @@ class Core {
         Job hint_job;
         hint_job.ids = ids.data();
         hint_job.n = ids.size();
-        plan(&hint_job, nullptr);
+        try {
+          plan(&hint_job, nullptr);
+        } catch (const std::exception& e) {
+          std::lock_guard<std::mutex> g(mu_);
+          set_error_locked(std::string("PLE hint planning failed: ") +
+                           e.what());
+        }
       }
       lk.lock();
     }
   }
 
+  // Settles what plan() holds on a demand job if it exits by an exception:
+  // its writer count and its planning step (failing the job), so waiters
+  // fail closed instead of hanging.
+  struct PlanGuard {
+    Core& core;
+    Job* job;
+    bool writer = false;
+    bool step = false;
+    ~PlanGuard() {
+      if (!writer && !step) return;
+      std::lock_guard<std::mutex> lk(core.mu_);
+      if (writer) --job->writers;
+      if (step) {
+        job->failed = true;
+        core.finish_pending_locked(job, 1);
+      }
+      core.cv_done_.notify_all();
+    }
+  };
+
   // Resolves cache hits and out-of-range rows, then attaches the misses to
   // reads (new or already queued / in flight): remote GETs for rows already
-  // uploaded, SSD page reads otherwise. `owner` is null for hints.
-  void plan(Job* job, const JobPtr& owner) {
+  // uploaded, SSD page reads otherwise. `owner` is null for hints. On the
+  // stream (`on_stream`), it wakes one I/O worker and leaves the others to
+  // the planner thread: each wake-up is a system call the stream would wait
+  // for.
+  void plan(Job* job, const JobPtr& owner, bool on_stream = false) {
     const bool demand = owner != nullptr;
+    PlanGuard guard{*this, job};
     if (demand) {
       std::lock_guard<std::mutex> lk(mu_);
       if (job->cancelled || closed_) {
         job->failed = true;
-        finish_pending(job, 1);
+        finish_pending_locked(job, 1);
         cv_done_.notify_all();
         return;
       }
       ++job->writers;
+      guard.writer = guard.step = true;
     }
     const uint64_t ready = remote_.ready_rows.load(std::memory_order_acquire);
     std::vector<Miss> misses;
+    if (demand) misses.reserve(job->n);
     uint64_t hits = 0;
     bool any_remote = false;
     for (size_t i = 0; i < job->n; ++i) {
@@ -944,31 +1153,28 @@ class Core {
         ++hits;
         continue;
       }
-      misses.push_back(disk_miss(row, seg, dst));
       if (row < ready) {
-        Miss& m = misses.back();
-        m.remote = true;
-        m.key = kRemoteKey | row;
-        m.in_page = 0;
-        m.length = rb_;
+        misses.push_back(Miss{kRemoteKey | row, row, 0, 0, rb_, 0, true, dst});
         any_remote = true;
+      } else {
+        misses.push_back(disk_miss(row, seg, dst));
       }
     }
-    auto by_key = [](const Miss& a, const Miss& b) { return a.key < b.key; };
-    std::sort(misses.begin(), misses.end(), by_key);
 
     size_t queued = 0, queued_remote = 0;
     {
       std::lock_guard<std::mutex> lk(mu_);
       if (demand) {
         --job->writers;
+        guard.writer = false;
         stats_.requests += job->n;
         stats_.cache_hits += hits;
       }
       if (closed_) {
         if (demand) {
+          guard.step = false;
           job->failed = true;
-          finish_pending(job, 1);
+          finish_pending_locked(job, 1);
           cv_done_.notify_all();
         }
         return;
@@ -980,7 +1186,6 @@ class Core {
           locate(static_cast<int64_t>(m.row), &seg);
           m = disk_miss(m.row, seg, m.dst);
         }
-        std::sort(misses.begin(), misses.end(), by_key);
       }
       for (size_t i = 0; i < misses.size();) {
         size_t j = i;
@@ -999,11 +1204,18 @@ class Core {
         }
         i = j;
       }
-      if (demand && finish_pending(job, 1)) cv_done_.notify_all();
+      // One kick per plan: the busy-polling remote thread then takes the
+      // mutex once, after the queues are complete.
+      if (queued_remote) remote_.kick.fetch_add(1);
+      if (on_stream && queued > 1) worker_wakes_ += queued - 1;
+      guard.step = false;
+      if (demand && finish_pending_locked(job, 1)) cv_done_.notify_all();
       if (demand && job->writers == 0 && job->cancelled) cv_done_.notify_all();
     }
     if (queued_remote) remote_.wake();
-    notify_workers(queued);
+    if (!on_stream) return notify_workers(queued);
+    if (queued > 0) cv_work_.notify_one();
+    if (queued > 1) cv_plan_.notify_one();
   }
 
   void notify_workers(size_t queued) {
@@ -1021,7 +1233,6 @@ class Core {
     const uint32_t file = seg_file_[seg];
     const uint64_t key = (uint64_t{file} << 52) | (first >> 12);
     return Miss{key,
-                key,
                 row,
                 first,
                 static_cast<uint32_t>(at - first),
@@ -1051,7 +1262,8 @@ class Core {
       }
       stats_.dedup_rows += group;
     } else {
-      if (!demand && hq.size() >= kHintQueueReads) {
+      if (!demand && (hq.size() >= kHintQueueReads ||
+                      (m.remote ? rhint_cap_ : hint_cap_) == 0)) {
         stats_.hint_dropped += group;
         return nullptr;
       }
@@ -1068,14 +1280,17 @@ class Core {
       stats_.dedup_rows += group - 1;
       *fresh = true;
     }
-    if (*fresh && m.remote) remote_.kick.fetch_add(1);
     return r;
   }
 
-  // Returns true when the job just completed.
-  static bool finish_pending(Job* job, uint64_t k) {
+  // Lock held. Counts `k` more of `job` done; returns true when the job just
+  // completed, which publishes it to spinning waiters.
+  bool finish_pending_locked(Job* job, uint64_t k) {
     job->pending -= k;
-    return job->pending == 0;
+    if (job->pending != 0) return false;
+    record_step_locked(*job);
+    job->done.store(true, std::memory_order_release);
+    return true;
   }
 
   bool locate(int64_t id, size_t* seg) const {
@@ -1089,9 +1304,13 @@ class Core {
     return true;
   }
 
+  // Demand reads first; hints only when `hints` (below their slot cap). A
+  // hint read upgraded to demand sits in both queues, so whatever comes from
+  // `hq` is a hint.
   static ReadPtr pop_read_locked(std::deque<ReadPtr>& dq,
-                                 std::deque<ReadPtr>& hq) {
+                                 std::deque<ReadPtr>& hq, bool hints) {
     for (auto* q : {&dq, &hq}) {
+      if (q == &hq && !hints) break;
       while (!q->empty()) {
         ReadPtr r = std::move(q->front());
         q->pop_front();
@@ -1101,17 +1320,35 @@ class Core {
     return nullptr;
   }
 
+  static void start_read_locked(PageRead& r, uint32_t* hints_inflight,
+                                uint64_t* hints_peak) {
+    r.started = true;
+    if (r.demand) return;
+    r.hint_slot = true;
+    *hints_peak = std::max<uint64_t>(*hints_peak, ++*hints_inflight);
+  }
+
+  static void end_hint_slot_locked(PageRead& r, uint32_t* hints_inflight) {
+    if (!r.hint_slot) return;
+    r.hint_slot = false;
+    --*hints_inflight;
+  }
+
+  bool disk_reads_ready_locked() const {
+    return !free_slots_.empty() &&
+           (!demand_q_.empty() ||
+            (!hint_q_.empty() && hint_inflight_ < hint_cap_));
+  }
+
   void worker_loop() {
     std::unique_lock<std::mutex> lk(mu_);
     for (;;) {
-      cv_work_.wait(lk, [&] {
-        return closed_ || (!free_slots_.empty() &&
-                           (!demand_q_.empty() || !hint_q_.empty()));
-      });
+      cv_work_.wait(lk, [&] { return closed_ || disk_reads_ready_locked(); });
       if (closed_) return;
-      ReadPtr r = pop_read_locked(demand_q_, hint_q_);
+      ReadPtr r =
+          pop_read_locked(demand_q_, hint_q_, hint_inflight_ < hint_cap_);
       if (!r) continue;
-      r->started = true;
+      start_read_locked(*r, &hint_inflight_, &counters_.disk_hint_peak);
       const uint32_t slot = free_slots_.back();
       free_slots_.pop_back();
       uint8_t* buf = slab_ + size_t{slot} * 2 * kPage;
@@ -1149,7 +1386,7 @@ class Core {
       if (job == nullptr) continue;
       if (u.live && --job->writers == 0 && job->cancelled) notify = true;
       if (err != 0 || u.in_page + rb_ > got) job->failed = true;
-      if (finish_pending(job, 1)) notify = true;
+      if (finish_pending_locked(job, 1)) notify = true;
     }
     uses.clear();
     return notify;
@@ -1180,6 +1417,7 @@ class Core {
 
     lk.lock();
     free_slots_.push_back(static_cast<uint32_t>(slot));
+    end_hint_slot_locked(*r, &hint_inflight_);
     ++stats_.reads;
     stats_.bytes += got;
     latency_.add(us);
@@ -1192,7 +1430,7 @@ class Core {
                        std::to_string(r->length) + " bytes): file truncated?");
     }
     const bool notify = release_uses_locked(r->uses, err, got);
-    if (!demand_q_.empty() || !hint_q_.empty()) cv_work_.notify_one();
+    if (disk_reads_ready_locked()) cv_work_.notify_one();
     lk.unlock();
     if (notify) cv_done_.notify_all();
   }
@@ -1250,6 +1488,7 @@ class Core {
   // page reads (fallback) or fails their jobs. Returns true when a job
   // completed; `queued` counts newly queued disk reads.
   bool requeue_remote_locked(const ReadPtr& r, size_t* queued) {
+    end_hint_slot_locked(*r, &rhint_inflight_);
     if (r->finished) return false;
     auto it = inflight_.find(r->key);
     if (it != inflight_.end() && it->second == r) inflight_.erase(it);
@@ -1270,7 +1509,7 @@ class Core {
       }
       if (!u.job) continue;
       u.job->failed = true;
-      if (finish_pending(u.job.get(), 1)) done = true;
+      if (finish_pending_locked(u.job.get(), 1)) done = true;
     }
     return done;
   }
@@ -1279,6 +1518,8 @@ class Core {
 
   const uint32_t rb_;
   const double timeout_us_;
+  const double wait_spin_us_;
+  const uint64_t inline_plan_rows_;
   std::vector<std::string> paths_;
   std::vector<uint32_t> seg_file_;
   std::vector<uint64_t> seg_offset_, seg_start_, seg_rows_;
@@ -1296,17 +1537,31 @@ class Core {
   bool closed_ = false;
   std::vector<uint32_t> free_slots_;
   std::deque<ReadPtr> demand_q_, hint_q_;
-  std::unordered_map<uint64_t, ReadPtr> inflight_;
-  std::deque<JobPtr> plan_q_;
+  uint32_t hint_inflight_ = 0, hint_cap_ = 1;
+  // Only touched under mu_, so its nodes come from an unsynchronized pool.
+  std::pmr::unsynchronized_pool_resource inflight_nodes_;
+  std::pmr::unordered_map<uint64_t, ReadPtr> inflight_{&inflight_nodes_};
   std::deque<std::vector<int64_t>> hint_inbox_;
   size_t hint_inbox_rows_ = 0;
+  size_t worker_wakes_ = 0;  // left to the planner thread by on-stream plans
   Stats stats_;
-  LatencyRing latency_, remote_latency_;
+  std::deque<JobPtr> plan_q_;  // demand jobs for the planner thread
+  JobPtr mail_job_;            // demand job mailed to the remote thread
+  bool mailbox_open_ = false;
+  LatencyRing latency_, remote_latency_, demand_latency_, demand_small_latency_,
+      wait_latency_;
+  // How demand jobs were planned and waited for, and hint slot peaks (for
+  // tests; see debug_counters()).
+  struct Counters {
+    uint64_t inline_plans = 0, mailbox_plans = 0, planner_plans = 0;
+    uint64_t wait_sleeps = 0, disk_hint_peak = 0, remote_hint_peak = 0;
+  } counters_;
   std::string error_;
 
   // Remote source state, guarded by mu_ like the remote read queues.
   ple_remote::Link remote_;
   std::deque<ReadPtr> rdemand_q_, rhint_q_;
+  uint32_t rhint_inflight_ = 0, rhint_cap_ = 1;
 
   const int64_t* bound_ids_ = nullptr;
   const int64_t* bound_num_tokens_ = nullptr;
@@ -1413,13 +1668,14 @@ class Reader {
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   using Release = py::call_guard<py::gil_scoped_release>;
   py::class_<Reader>(m, "Reader")
-      .def(py::init<const std::vector<std::string>&,
-                    const std::vector<int64_t>&, const std::vector<int64_t>&,
-                    const std::vector<int64_t>&, const std::vector<int64_t>&,
-                    int64_t, int64_t, int64_t, int64_t, bool, double,
-                    const std::string&, const std::string&, int64_t, int64_t,
-                    int64_t, double, bool, int64_t, const std::string&, bool>(),
-           Release())
+      .def(
+          py::init<const std::vector<std::string>&, const std::vector<int64_t>&,
+                   const std::vector<int64_t>&, const std::vector<int64_t>&,
+                   const std::vector<int64_t>&, int64_t, int64_t, int64_t,
+                   int64_t, bool, double, const std::string&,
+                   const std::string&, int64_t, int64_t, int64_t, double, bool,
+                   int64_t, const std::string&, bool, bool, double, int64_t>(),
+          Release())
       .def("close", &Reader::close, Release())
       .def(
           "read_rows",
@@ -1452,6 +1708,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("direct_io", [](Reader& r) { return r.core().direct_io(); })
       .def("stats", [](Reader& r) { return r.core().stats(); })
       .def("remote_status", [](Reader& r) { return r.core().remote_status(); })
-      .def("reset_stats", [](Reader& r) { r.core().reset_stats(); });
+      .def("reset_stats", [](Reader& r) { r.core().reset_stats(); })
+      .def("debug_counters",
+           [](Reader& r) { return r.core().debug_counters(); });
   m.attr("REMOTE_BACKENDS") = py::tuple(py::cast(remote_backend_names()));
 }

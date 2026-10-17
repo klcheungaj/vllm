@@ -36,7 +36,16 @@ from vllm.models.qwen4_exp.common.ple_disk_reader import (
     ucx_build_flags,
 )
 
-from .test_ple_disk_reader import HEADER_A, NUM_ROWS, ROW_BYTES, _mixed_ids, _Table
+from .test_ple_disk_reader import (
+    HEADER_A,
+    NUM_ROWS,
+    ROW_BYTES,
+    _bound_buffers,
+    _expected_tokens,
+    _mixed_ids,
+    _Table,
+    requires_cuda,
+)
 
 SERVER_DIR = os.path.join(os.path.dirname(qwen4_common.__file__), "ple_mem_server")
 
@@ -195,10 +204,17 @@ def _wait_state(reader: PLEDiskReader, state: str, timeout_s: float = 10.0) -> N
         time.sleep(0.01)
 
 
-def test_remote_reads_bit_exact(table, remote):
+@pytest.mark.parametrize("busy_poll", [True, False], ids=["busy", "sleep"])
+def test_remote_reads_bit_exact(table, remote, busy_poll):
     """After the upload every row (incl. ones at region edges, page-straddling
-    and out-of-range ids) comes from the server, matching the files."""
-    reader = _reader(table.segments, remote.address, remote.backend)
+    and out-of-range ids) comes from the server, matching the files, whether
+    the remote thread busy-polls or sleeps when idle."""
+    reader = _reader(
+        table.segments,
+        remote.address,
+        remote.backend,
+        remote={"busy_poll": busy_poll},
+    )
     try:
         assert reader.wait_remote_ready(30)
         status = reader.remote_status()
@@ -271,6 +287,153 @@ def test_hints_prefetch_from_remote(table, remote):
         stats = reader.stats()
         assert stats["cache_hits"] == ids.size
         assert stats["reads"] == stats["remote_reads"] == 0
+    finally:
+        reader.close()
+
+
+# One region and one upload chunk per segment, so a slow loopback still
+# uploads the table in about one delay.
+_FEW_WRITES = {"region_bytes": 1 << 30, "upload_chunk_bytes": 64 << 20}
+
+
+def test_demand_not_queued_behind_hints(table):
+    """Hints take at most half of the in-flight remote slots: a demand read
+    issued while thousands of hints are queued is sent right away, so it
+    completes in one transport delay instead of waiting for hint slots."""
+    delay_s = 0.4
+    reader = _loopback(
+        table.segments,
+        f"?delay_us={int(delay_s * 1e6)}",
+        cache_rows=8192,
+        remote={**_FEW_WRITES, "max_inflight": 8},
+    )
+    try:
+        assert reader.wait_remote_ready(30)
+        hinted = np.arange(0, 2 * 2000, 2, dtype=np.int64)
+        reader.hint(hinted)
+        deadline = time.monotonic() + 10
+        while reader.stats()["hint_reads"] < hinted.size:
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
+        time.sleep(0.05)
+        ids = np.array([1, 3, 5, 7], dtype=np.int64)
+        start = time.monotonic()
+        np.testing.assert_array_equal(_read(reader, ids), table.expected(ids))
+        elapsed = time.monotonic() - start
+        stats = reader.stats()
+        assert stats["hint_reads"] - stats["remote_reads"] > 1000
+        assert elapsed < 1.5 * delay_s, elapsed
+        reader.check_error()
+    finally:
+        reader.close()
+
+
+class _Steps:
+    """Notifies and waits for steps of `max_tokens` x 16 rows on the
+    current stream, checking every row."""
+
+    def __init__(self, reader: PLEDiskReader, table: _Table) -> None:
+        self.table = table
+        self.max_tokens, self.heads = 32, 16
+        _, self.views = _bound_buffers(reader, self.max_tokens, self.heads)
+        self.reader = reader
+
+    def run(self, seed: int) -> None:
+        ids_v, num_v, out_v = self.views
+        n = self.max_tokens * self.heads
+        ids = _mixed_ids(self.table, n, seed)[:n].reshape(self.max_tokens, -1)
+        ids_v.copy_(torch.from_numpy(ids).cuda())
+        num_v.fill_(self.max_tokens)
+        stream = torch.cuda.current_stream()
+        self.reader.launch_notify(stream)
+        self.reader.launch_wait(stream)
+        result = out_v.clone()
+        torch.accelerator.synchronize()
+        np.testing.assert_array_equal(
+            result.cpu().numpy(), _expected_tokens(self.table, ids)
+        )
+
+
+@requires_cuda
+@pytest.mark.parametrize(
+    "wait_spin_us, busy_poll",
+    [(0.0, True), (100.0, True), (1e6, True), (100.0, False)],
+    ids=["sleep", "default", "spin", "no-busy-poll"],
+)
+def test_notify_wait_remote(table, wait_spin_us, busy_poll):
+    """Remote rows arriving after the wait's spin budget (2 ms transport
+    delay) still all land before the stream goes on. With busy polling the
+    notify mails its job to the remote thread, otherwise it plans the job
+    itself; a wait that spins long enough never sleeps."""
+    reader = _loopback(
+        table.segments,
+        "?delay_us=2000",
+        remote={**_FEW_WRITES, "busy_poll": busy_poll},
+        wait_spin_us=wait_spin_us,
+    )
+    try:
+        assert reader.wait_remote_ready(30)
+        reader.reset_stats()
+        steps = _Steps(reader, table)
+        for seed in (31, 32):
+            steps.run(seed)
+        stats = reader.stats()
+        assert stats["reads"] == 0 and stats["remote_reads"] > 0
+        assert stats["demand_us_p50"] >= 2000
+        # The wait starts well before the rows arrive, so it blocks (or
+        # spins) for most of the delay.
+        assert stats["wait_us_p50"] >= 500
+        counters = reader._reader.debug_counters()
+        assert counters["mailbox_plans" if busy_poll else "inline_plans"] == 2
+        assert counters["wait_sleeps"] == (0 if wait_spin_us >= 1e6 else 2)
+        reader.check_error()
+    finally:
+        reader.close()
+
+
+@requires_cuda
+def test_notify_after_remote_failure(table):
+    """When the transport fails under load, the remote thread closes its
+    mailbox on the way out: steps notified around and after the failure
+    still get every row (from the SSD), planned by the notify itself."""
+    reader = _loopback(table.segments, "?fail_after=2000", remote=_FEW_WRITES)
+    try:
+        assert reader.wait_remote_ready(30)
+        steps = _Steps(reader, table)
+        for seed in range(50, 60):
+            steps.run(seed)
+        _wait_state(reader, "failed")
+        for seed in range(60, 80):
+            steps.run(seed)
+            if reader._reader.debug_counters()["inline_plans"]:
+                break
+        counters = reader._reader.debug_counters()
+        assert counters["mailbox_plans"] > 0 and counters["inline_plans"] > 0
+        reader.check_error()
+    finally:
+        reader.close()
+
+
+def test_busy_poll_parks_when_idle(table):
+    """The busy-polling remote thread spins while there is remote work,
+    parks after about a second without any (no longer burning a core), and
+    serves the next read."""
+    reader = _loopback(table.segments, remote=_FEW_WRITES)
+    try:
+        assert reader.wait_remote_ready(30)
+        ids = _mixed_ids(table, 500, 15)
+        np.testing.assert_array_equal(_read(reader, ids), table.expected(ids))
+
+        def cpu_seconds(wall_s: float) -> float:
+            start = time.process_time()
+            time.sleep(wall_s)
+            return time.process_time() - start
+
+        spinning = cpu_seconds(0.4)
+        time.sleep(1.0)
+        parked = cpu_seconds(0.4)
+        assert spinning > 0.25 and parked < 0.1, (spinning, parked)
+        np.testing.assert_array_equal(_read(reader, ids), table.expected(ids))
     finally:
         reader.close()
 
@@ -410,6 +573,7 @@ def test_backend_selection(table):
     assert disk_only.REMOTE_BACKENDS == ()
     args = [[table.path_a], [0], [HEADER_A], [0], [10], ROW_BYTES, 0, 1, 1, False]
     remote = [1.0, "loopback", "loopback", 1, ROW_BYTES, 1, 1.0, True, 1, "", False]
+    remote += [True, 100.0, 1024]
     with pytest.raises(ValueError, match=r"not compiled into this reader .*none"):
         disk_only.Reader(*args, *remote)
 
@@ -741,6 +905,34 @@ def test_server_limits(bin_dir, start_server):
     server = start_server("--max-client-regions", "4")
     over = _bench(bin_dir, server.address, "--bytes", "5", "--region-bytes", "1")
     assert over.returncode != 0 and "region limit" in over.stderr
+
+
+@requires_ucx
+def test_server_hugepage_accounting(bin_dir, start_server):
+    """Regions of 2 MiB or more are huge-page backed by default and charged
+    their 2 MiB-rounded size; --no-hugepages charges 4 KiB pages."""
+    args = ("--bytes", "6M", "--region-bytes", "3M")
+    server = start_server("--max-memory", "6M")
+    assert "huge pages" in server.wait_for("listening on")
+    over = _bench(bin_dir, server.address, *args)
+    assert over.returncode != 0 and "max-memory" in over.stderr
+    server = start_server("--max-memory", "6M", "--no-hugepages")
+    ok = _bench(bin_dir, server.address, *args)
+    assert ok.returncode == 0, ok.stderr
+
+
+@requires_ucx
+def test_server_hugepage_regions_aligned(bin_dir, start_server):
+    """Huge-page regions are mapped 2 MiB-aligned (so transparent huge
+    pages can back them); --verbose logs each one and a borrow summary."""
+    server = start_server("--max-memory", "64M", "--verbose")
+    ok = _bench(bin_dir, server.address, "--bytes", "6M", "--region-bytes", "3M")
+    assert ok.returncode == 0, ok.stderr
+    line = server.wait_for("borrowed region")
+    match = re.search(r" at (0x[0-9a-f]+), populated in ", line)
+    assert match, line
+    assert int(match.group(1), 16) % (2 << 20) == 0
+    assert "huge pages" in server.wait_for("borrowed 2 regions")
 
 
 @requires_ucx

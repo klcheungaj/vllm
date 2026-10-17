@@ -42,12 +42,25 @@ make OUT=/tmp/ple            # put the binaries elsewhere
 | `--token-file` | none | Shared secret clients must send (file content, surrounding whitespace trimmed, at most 256 bytes) |
 | `--allow-tcp` | off | Allow UCX's tcp transport (insecure, see below) |
 | `--event-wait` | off | Sleep on UCX wakeup events between requests: saves a core, adds wakeup latency (default busy-polls) |
-| `--hugepages` | off | `madvise(MADV_HUGEPAGE)` on lent regions |
-| `--verbose` | off | Log every allocation and release |
+| `--no-hugepages` | off | Back lent regions with 4 KiB pages only (by default, regions of 2 MiB or more get transparent huge pages; `--hugepages` is accepted as a no-op) |
+| `--verbose` | off | Log every allocation (address, populate time, share backed by huge pages) and release |
 
 Regions are prefaulted when lent, so a shortage fails the client's startup
-instead of a later access. Every region is charged its mapped size (rounded up
-to 4 KiB, or 2 MiB with `--hugepages`). A client's regions are freed when it
+instead of a later access. Regions of 2 MiB or more are mapped 2 MiB-aligned
+and madvised (`MADV_HUGEPAGE`) so that transparent huge pages back them and
+random row reads rarely miss the TLB; this needs
+`/sys/kernel/mm/transparent_hugepage/enabled` set to `always` or `madvise`
+(the server logs when it is `never`). With
+`/sys/kernel/mm/transparent_hugepage/defrag` at `madvise` (a common default),
+populating may compact memory synchronously, which can slow the startup of a
+long-running, fragmented server. The server logs one line per client borrow
+(regions, size, duration, time spent populating, share in huge pages);
+`--verbose` adds one per region. Clients bound the wait for each region, not
+the whole borrow (`remote_connect_timeout_s` in vLLM, `--timeout` here).
+Every region is charged its mapped size:
+rounded up to 2 MiB for those, to 4 KiB otherwise (and with
+`--no-hugepages`). A read request prefetches all of its rows before copying
+them into the reply, so their memory accesses overlap. A client's regions are freed when it
 releases them, disconnects or dies. Connections, refusals and totals are
 logged to stderr. SIGINT / SIGTERM shut the server down.
 
@@ -104,10 +117,12 @@ It borrows `--bytes` (in `--region-bytes` regions) and uploads them in
 
 - **Ping**: the idle round trip of a one-row read, `--ping-iters` times
   (min / mean / p50 / p90 / p99 / p99.9 / max).
-- **Step latency**: for each `--step-rows` size, the time to fetch that many
-  random rows the way vLLM's reader does: posted at once as requests of at
-  most `--step-batch` rows (match `remote_max_batch_rows`) and timed until
-  the last row arrives, `--step-iters` times. A step reads about
+- **Step latency**: for each `--step-batch` size B and each `--step-rows`
+  size, the time to fetch that many random rows the way vLLM's reader does:
+  posted at once as requests of at most B rows (`remote_max_batch_rows`)
+  and timed until the last row arrives, `--step-iters` times. `--verify`
+  checks rows inside the timed loop, so leave it off when comparing batch
+  sizes. A step reads about
   tokens x 16 rows (one per PLE head); compare its latency with the compute
   before the PLE layer.
 - **Sweep**: batched row reads for each `--batch-rows` x `--depth` point

@@ -120,16 +120,28 @@ vllm serve <qwen4exp-checkpoint> \
 | --- | --- | --- |
 | `disk_row_cache_rows` | `1048576` | Rows kept in a host-memory row cache; `0` disables it. |
 | `disk_io_threads` | `16` | I/O worker threads. |
-| `disk_max_inflight` | `256` | Maximum outstanding row reads. |
+| `disk_max_inflight` | `256` | Maximum outstanding row reads. Prefetch hints use at most half (rounded down) of `min(disk_io_threads, disk_max_inflight)`, so step reads always find a free one; with fewer than two, hints are not prefetched from the SSD. |
 | `disk_direct_io` | `true` | Read with `O_DIRECT`, falling back to buffered reads where the filesystem does not support it. |
 | `disk_prefetch_hints` | `true` | Prefetch the rows of upcoming prefill chunks into the row cache while earlier steps run; has no effect when the row cache is disabled. |
 | `disk_wait_timeout_s` | `60.0` | Seconds a step waits for its reads before failing. |
+| `disk_wait_spin_us` | `100.0` | Microseconds a step's wait spins on the CPU for its rows before sleeping, avoiding a thread wake-up on the decode critical path. |
+| `disk_inline_plan_rows` | `1024` | Largest step (in rows) whose reads are planned on the latency path: by the busy-polling remote reader thread when there is one, else by the step's notify on the CUDA stream, which then waits for it (about 0.1 us per row plus one thread wake-up). Larger steps (prefill chunks) are planned by a background thread while the step computes; `0` sends every step there. |
 | `disk_stats_interval_s` | `60.0` | Seconds between reader statistics log lines; `0` disables them. |
 
 To size `disk_row_cache_rows`, watch the periodic `PLE disk ...` log line: it
-reports the row-cache hit rate, SSD reads, read latency, and the average time
-each step waited for its rows. Raise the cache until the wait stops shrinking;
-each million rows costs about 160 MB of host memory for an FP8 table.
+reports the row-cache hit rate, SSD reads and their latency, how long each
+step took to get all its rows (`step rows ready`, p50/p99/max over all
+steps, including failed or timed-out ones; then p50/p99 over decode-size
+steps of at most 1024 rows), and how long the step actually blocked waiting
+for them, spinning included (`step wait`). Raise the cache until the wait
+stops shrinking; each million rows costs about 160 MB of host memory for an
+FP8 table.
+
+During decode, each step reads 16 rows per token the model processes (one
+per PLE n-gram head), all at once when the step starts: for example 4 users
+with 3 MTP draft tokens read 4 x 4 x 16 = 256 rows. These rows cannot be
+prefetched, so they must arrive while the embedding and the first decoder
+layer compute; a `step wait` near zero means the reads are fully hidden.
 
 Only `disk_offload` itself affects the compilation cache; the knobs (and
 `cpu_offload`, which disk offload overrides) can be changed without
@@ -199,7 +211,7 @@ files:
 make -C ple_mem_server            # finds UCX with pkg-config
 make -C ple_mem_server UCX_HOME=/opt/ucx   # or from a UCX install prefix
 ./ple_mem_server/ple_mem_server --host 10.0.0.2 --port 18515 \
-  --max-memory 64G --token-file /etc/ple/token --hugepages
+  --max-memory 64G --token-file /etc/ple/token
 ```
 
 | Server flag | Default | Meaning |
@@ -212,8 +224,15 @@ make -C ple_mem_server UCX_HOME=/opt/ucx   # or from a UCX install prefix
 | `--token-file` | none | Require the shared secret in this file from clients. |
 | `--allow-tcp` | off | Allow UCX's tcp transport; insecure, see **Security** below. |
 | `--event-wait` | off | Sleep on UCX wakeup events between requests instead of busy-polling; saves a CPU core at the cost of wakeup latency. |
-| `--hugepages` | off | Back regions with transparent huge pages. |
-| `--verbose` | off | Log every allocation and release to stderr. |
+| `--no-hugepages` | off | Back regions with 4 KiB pages instead of 2 MiB-aligned transparent huge pages (the default, which saves a TLB miss on most random row reads). |
+| `--verbose` | off | Log every allocation (address, populate time, share in huge pages) and release to stderr. |
+
+Every region is populated when it is lent, and the server logs one line per
+client borrow with its size, duration, populate time and the share backed by
+huge pages. Populating tens of GB takes a while (more when the kernel has to
+compact memory for huge pages, see `transparent_hugepage/defrag`); vLLM's
+`remote_connect_timeout_s` bounds the wait for each region, not the whole
+borrow.
 
 The same directory builds `ple_mem_bench`, a standalone client that measures
 the link before vLLM uses it: upload bandwidth; the idle round-trip latency
@@ -225,7 +244,7 @@ Run it from the vLLM machine with the same UCX environment:
 
 ```bash
 ./ple_mem_server/ple_mem_bench --server 10.0.0.2:18515 --bytes 4G \
-  --step-rows 128,256,1024 --step-batch 256 \
+  --step-rows 64,128,256 --step-batch 64,128,256 \
   --batch-rows 1,64,256,1024 --depth 1,4,16 --seconds 5 \
   --token-file /etc/ple/token
 ```
@@ -233,7 +252,8 @@ Run it from the vLLM machine with the same UCX environment:
 A decode step reads about 16 rows per scheduled token (for example 4 users
 with 3 MTP draft tokens: 16 tokens, 256 rows). If the step latency stays
 well below the compute before the PLE layer, remote reads are fully hidden;
-the `PLE disk ...` log line's average wait per step confirms it in vLLM.
+in vLLM, the `PLE disk ...` log line's `step rows ready` and `step wait`
+latencies confirm it.
 
 `--verify` checks every read against the uploaded pattern, `--probe` checks
 that the server rejects out-of-bounds and foreign-region requests, and
@@ -253,14 +273,15 @@ vllm serve <qwen4exp-checkpoint> \
 | --- | --- | --- |
 | `remote_memory_server` | `None` | Address of the memory server, `host:port` (or `[ipv6]:port`) for `ucx`; requires `disk_offload`. |
 | `remote_memory_backend` | `ucx` | Transport used to reach the server. |
-| `remote_max_inflight` | `256` | Maximum outstanding remote row reads. |
+| `remote_max_inflight` | `1024` | Maximum outstanding remote row reads; prefetch hints use at most half (rounded down), so decode reads never wait behind them; with fewer than two, hints are not prefetched remotely. |
 | `remote_max_batch_rows` | `256` | Maximum rows in one read request (at most `1024`). |
 | `remote_region_bytes` | `1073741824` | Size of each borrowed memory region. |
 | `remote_upload_chunk_bytes` | `67108864` | Size of each staging buffer used for the upload. |
-| `remote_connect_timeout_s` | `30.0` | Seconds to wait for connecting and borrowing the regions. |
+| `remote_connect_timeout_s` | `30.0` | Seconds to wait for connecting, and for each borrowed region (the server populates a region before granting it); not a bound on the whole borrow. |
 | `remote_fallback_to_disk` | `true` | Keep reading from the SSD when the server is unreachable or fails; otherwise such a failure is fatal. |
 | `remote_token_file` | `None` | File holding the shared secret of the server's `--token-file`. |
 | `remote_allow_insecure_transport` | `false` | Let UCX use its tcp transport; insecure, see **Security** below. |
+| `remote_busy_poll` | `true` | Keep the remote reader thread polling instead of sleeping, for the lowest decode latency: it also plans each decode step's reads, so the step's notify on the CUDA stream only hands the step over. Costs one CPU core per GPU worker while requests run (the server busy-polls one more); after about a second without remote work the thread parks, and the first step after that pays one thread wake-up. |
 
 The other `remote_*` fields are only valid together with
 `remote_memory_server`. Like the disk knobs, they do not affect the
@@ -312,6 +333,11 @@ containers.
 holds whole rows). By default it lends at most 90% of the memory available
 when it starts; set `--max-memory` to cap it explicitly, and
 `--max-regions`/`--max-client-regions` to bound the region count.
+On a multi-socket server, run it on the NUMA node the NIC is attached to
+(`cat /sys/class/net/<dev>/device/numa_node`), with its memory there too,
+e.g. `numactl --cpunodebind=0 --membind=0 ./ple_mem_server ...`, so that row
+reads do not cross the socket interconnect; that node then needs the whole
+table in free memory.
 
 **Security.** Run the memory server only on a trusted network, bound to the
 RDMA interface. The server can only reach memory the client registered for

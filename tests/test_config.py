@@ -1737,6 +1737,8 @@ def test_engram_disk_tunables_keep_compile_hash():
         disk_prefetch_hints=False,
         disk_wait_timeout_s=1.0,
         disk_stats_interval_s=0.0,
+        disk_wait_spin_us=0.0,
+        disk_inline_plan_rows=0,
         remote_memory_server="10.0.0.2:18515",
         remote_memory_backend="ucx",
         remote_max_inflight=8,
@@ -1747,6 +1749,7 @@ def test_engram_disk_tunables_keep_compile_hash():
         remote_max_batch_rows=16,
         remote_token_file="/etc/ple/token",
         remote_allow_insecure_transport=True,
+        remote_busy_poll=False,
     )
     assert tuned.compute_hash() == EngramConfig(disk_offload=True).compute_hash()
 
@@ -1769,6 +1772,8 @@ def test_engram_disk_offload_hash_ignores_cpu_offload():
         {"disk_max_inflight": 0},
         {"disk_wait_timeout_s": 0.0},
         {"disk_stats_interval_s": -1.0},
+        {"disk_wait_spin_us": -1.0},
+        {"disk_inline_plan_rows": -1},
         {"remote_max_inflight": 0},
         {"remote_region_bytes": (1 << 20) - 1},
         {"remote_upload_chunk_bytes": (1 << 20) - 1},

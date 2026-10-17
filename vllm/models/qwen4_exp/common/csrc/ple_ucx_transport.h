@@ -51,8 +51,9 @@ class UcxTransport {
   }
 
   std::string borrow(const std::vector<uint64_t>& region_bytes,
-                     double timeout_s, const std::atomic<bool>& stop) {
-    return client_.borrow(region_bytes, timeout_s, &stop);
+                     double timeout_s, const std::atomic<bool>& stop,
+                     std::atomic<uint64_t>& granted) {
+    return client_.borrow(region_bytes, timeout_s, &stop, &granted);
   }
 
   void read(const ReadOp* ops, uint32_t n) { client_.read(ops, n); }

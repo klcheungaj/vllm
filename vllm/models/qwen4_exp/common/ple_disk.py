@@ -354,6 +354,7 @@ class Qwen4ExpPLEDiskEmbedding(Qwen4ExpPLEEmbedding):
                 max_batch_rows=config.remote_max_batch_rows,
                 token_file=config.remote_token_file,
                 allow_insecure_transport=config.remote_allow_insecure_transport,
+                busy_poll=config.remote_busy_poll,
             )
         self._remote_opened_at = time.monotonic()
         reader = PLEDiskReader(
@@ -367,6 +368,8 @@ class Qwen4ExpPLEDiskEmbedding(Qwen4ExpPLEEmbedding):
             max_inflight=config.disk_max_inflight,
             direct_io=config.disk_direct_io,
             wait_timeout_s=config.disk_wait_timeout_s,
+            wait_spin_us=config.disk_wait_spin_us,
+            inline_plan_rows=config.disk_inline_plan_rows,
             remote=remote,
         )
         reader.bind_demand(self._ids, self._num_tokens, self._staging)
@@ -446,7 +449,10 @@ class Qwen4ExpPLEDiskEmbedding(Qwen4ExpPLEEmbedding):
         fmt = (
             "PLE disk %s over %.0fs: %d rows requested, %.1f%% row-cache hits, "
             "%d SSD reads (%.1f MB), read p50 %.0f us p99 %.0f us, "
-            "%.0f us average wait per step, %d hinted rows (%d dropped)"
+            "step rows ready p50 %.0f us p99 %.0f us max %.0f us "
+            "(decode-size p50 %.0f us p99 %.0f us), "
+            "step wait p50 %.0f us p99 %.0f us (%.0f us average), "
+            "%d hinted rows (%d dropped)"
         )
         args: list[Any] = [
             self.prefix,
@@ -457,6 +463,13 @@ class Qwen4ExpPLEDiskEmbedding(Qwen4ExpPLEEmbedding):
             int(stats["bytes"]) / 1e6,
             stats["read_us_p50"],
             stats["read_us_p99"],
+            stats["demand_us_p50"],
+            stats["demand_us_p99"],
+            stats["demand_us_max"],
+            stats["demand_small_us_p50"],
+            stats["demand_small_us_p99"],
+            stats["wait_us_p50"],
+            stats["wait_us_p99"],
             float(stats["demand_wait_us"]) / jobs,
             int(stats["hint_rows"]),
             int(stats["hint_dropped"]),

@@ -130,12 +130,16 @@ class Client {
   }
 
   // Connects (trying every resolved address) and borrows one region per
-  // entry of `region_bytes`, all granted at exactly that size.
+  // entry of `region_bytes`, all granted at exactly that size. `timeout_s`
+  // bounds the wait for each answer (the server populates every region before
+  // granting it), not the whole borrow; `granted` counts the answers.
   std::string borrow(const std::vector<uint64_t>& region_bytes,
-                     double timeout_s, const std::atomic<bool>* stop) {
+                     double timeout_s, const std::atomic<bool>* stop,
+                     std::atomic<uint64_t>* granted = nullptr) {
     const uint64_t n = region_bytes.size();
-    const auto deadline = std::chrono::steady_clock::now() +
-                          std::chrono::duration<double>(timeout_s);
+    const auto step = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::duration<double>(timeout_s));
+    auto deadline = std::chrono::steady_clock::now() + step;
     for (size_t a = 0; a < addrs_.size(); ++a) {
       requested_ = region_bytes;
       regions_.assign(n, Region{});
@@ -154,11 +158,15 @@ class Client {
         req.bytes = region_bytes[i];
         control_send(&req, sizeof(req), opt_.token.data(), opt_.token.size());
       }
-      while (grants_ < n && refusal_.empty() && !failed_ &&
-             !(stop && stop->load()) &&
-             std::chrono::steady_clock::now() < deadline) {
+      for (uint64_t seen = 0; grants_ < n && refusal_.empty() && !failed_ &&
+                              !(stop && stop->load()) &&
+                              std::chrono::steady_clock::now() < deadline;) {
         progress();
         wait(-1, 10);
+        if (grants_ == seen) continue;
+        if (granted != nullptr) granted->fetch_add(grants_ - seen);
+        seen = grants_;
+        deadline = std::chrono::steady_clock::now() + step;
       }
       borrowing_ = false;
       if (failed_ && grants_ == 0 && a + 1 < addrs_.size() &&
@@ -175,7 +183,7 @@ class Client {
     if (failed_) return reason_;
     if (grants_ < n)
       return "timed out after " + std::to_string(timeout_s) +
-             " s connecting to " + opt_.address + " (" +
+             " s without an answer from " + opt_.address + " (" +
              std::to_string(grants_) + " of " + std::to_string(n) +
              " regions answered)";
     bool tcp = false;

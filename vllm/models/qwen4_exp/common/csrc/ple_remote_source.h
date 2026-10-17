@@ -25,7 +25,9 @@
 //  Control path (cold), in this order; each returns "" or an error message:
 //   std::string open(uint32_t read_tokens); read op tokens < read_tokens
 //   std::string borrow(const std::vector<uint64_t>& region_bytes,
-//                      double timeout_s, const std::atomic<bool>& stop);
+//                      double timeout_s, const std::atomic<bool>& stop,
+//                      std::atomic<uint64_t>& granted);  `timeout_s` bounds
+//                  each wait for the next grant; `granted` counts them
 //   void close();  returns the regions (when healthy and idle) and releases
 //                  everything; also safe after a failed open() or borrow().
 //  Data path (hot; non-blocking, no allocation once warm, no virtual calls):
@@ -36,7 +38,8 @@
 //                  is readable on the server; src stays valid until then
 //   void progress();
 //   void wait(int wake_fd, int timeout_ms);  sleeps until transport events,
-//                  `wake_fd` is readable or the timeout
+//                  `wake_fd` is readable or the timeout (unused when
+//                  busy-polling)
 //   uint64_t outstanding() const;  posted read ops and writes not completed
 //   uint64_t requests() const;     read requests sent so far
 //   std::vector<Completion>& completions();
@@ -53,14 +56,28 @@
 //                                 and this source's upload state
 //   Link& remote_link();
 //   bool closed_locked() const;
-//   RemoteRead pop_remote_read_locked();  next queued read, marked started
-//   bool remote_reads_queued_locked() const;
-//   void complete_remote_reads(std::vector<Delivered<RemoteRead>>&);
+//   RemoteRead pop_remote_read_locked();  next queued read, marked started;
+//                                 demand first, hints only while they hold
+//                                 less than half of max_inflight
+//   bool remote_reads_queued_locked() const;  a pop would return a read
+//   bool complete_remote_reads(std::vector<Delivered<RemoteRead>>&);  true
+//                                 when it freed a hint slot hints wait for
 //   void requeue_remote_reads(const std::vector<RemoteRead>&);  to the SSD
 //                                 or failed, per fallback_to_disk
 //   void fail_remote(const std::string& reason);  marks the Link failed,
 //                                 clears ready_rows, requeues queued reads
+//   void open_mailbox();   the remote thread plans small demand jobs now
+//   void plan_mailed();    plans the job in the mailbox (`Link::mail`), if any
+//   void close_mailbox();  stops the mailbox and plans a job left in it
 // The functions without `_locked` take the mutex themselves.
+//
+// With `busy_poll`, the remote thread does not sleep once set up: it spins on
+// `Link::mail`, `Link::kick` and transport progress, plans the demand jobs
+// that notify mails it and posts their reads in the same pass, without any
+// wake-up. After kIdleParkUs without work it parks on `Link::cv` (1 ms timed
+// waits, woken by a kick) until work comes back. Without `busy_poll` it
+// sleeps on `Link::cv` when idle and on the transport's events while only
+// uploads are outstanding, and the host plans demand jobs itself.
 //
 // The host owns the source through RemoteSourceBase, whose virtual functions
 // are the cold start / stop only; once started, the remote thread runs the
@@ -128,7 +145,19 @@ struct Params {
   bool fallback_to_disk = true;
   std::string token_file;
   bool allow_insecure_transport = false;
+  bool busy_poll = true;
 };
+
+// Spin-wait hint: `pause` on x86, `yield` on aarch64.
+inline void cpu_relax() {
+#if defined(__x86_64__) || defined(__i386__)
+  __builtin_ia32_pause();
+#elif defined(__aarch64__)
+  asm volatile("yield" ::: "memory");
+#else
+  std::atomic_signal_fence(std::memory_order_seq_cst);
+#endif
+}
 
 // Table files and segments (sorted by row_start, non-overlapping).
 struct Layout {
@@ -161,8 +190,10 @@ struct Link {
   uint64_t regions = 0;
   std::atomic<uint64_t> ready_rows{0};  // rows below are readable remotely
   std::atomic<uint64_t> kick{0};        // bumped whenever remote work queues
+  std::atomic<bool> mail{false};        // a demand job waits in the mailbox
   std::atomic<uint64_t> requests{0};    // read requests sent
   std::condition_variable cv;           // wakes the idle remote thread
+  std::atomic<bool> parked{false};      // it waits on `cv`
   std::atomic<int> wake_fd{-1};         // wakes it while it waits on uploads
   std::atomic<bool> sleeping{false};
 
@@ -170,9 +201,10 @@ struct Link {
     return state == State::kUploading || state == State::kReady;
   }
 
-  // Call after bumping `kick` (or requesting a stop).
+  // Call after bumping `kick` under the host mutex (or requesting a stop).
+  // Costs no system call while the remote thread busy-polls.
   void wake() {
-    cv.notify_all();
+    if (parked.load()) cv.notify_all();
     const int fd = wake_fd.load();
     if (fd >= 0 && sleeping.load()) {
       const uint64_t one = 1;
@@ -217,12 +249,20 @@ class RemoteSource final : public RemoteSourceBase {
     link_.wake_fd.store(wake_fd_);
     link_.state = State::kConnecting;
     remote_thread_ = std::thread([this] { run(); });
+    // The transport bounds each step of the setup; this guards against a
+    // stuck one, and is renewed by every granted region.
     const auto guard =
         std::chrono::duration<double>(params_.connect_timeout_s + 30.0);
     std::unique_lock<std::mutex> lk(host_.remote_mutex());
-    if (!cv_setup_.wait_for(lk, guard, [&] { return setup_done_; })) {
+    for (uint64_t seen = 0;;) {
+      if (cv_setup_.wait_for(lk, guard, [&] { return setup_done_; })) break;
+      if (granted_.load() != seen) {
+        seen = granted_.load();
+        continue;
+      }
       link_.state = State::kFailed;
       link_.error = "timed out setting up the remote memory source";
+      break;
     }
     if (link_.state == State::kFailed)
       return params_.fallback_to_disk ? "" : link_.error;
@@ -251,6 +291,7 @@ class RemoteSource final : public RemoteSourceBase {
 
  private:
   static constexpr uint32_t kUploadBuffers = 4;
+  static constexpr double kIdleParkUs = 1e6;
   static constexpr int kUploadWaitMs = 10;
 
   struct GetSlot {
@@ -291,7 +332,11 @@ class RemoteSource final : public RemoteSourceBase {
       setup_done_ = true;
     }
     cv_setup_.notify_all();
-    if (err.empty()) loop();
+    if (err.empty()) {
+      if (params_.busy_poll) host_.open_mailbox();
+      loop();
+      host_.close_mailbox();
+    }
     teardown();
   }
 
@@ -331,7 +376,7 @@ class RemoteSource final : public RemoteSourceBase {
     num_regions_ = (num_rows_ + params_.region_rows - 1) / params_.region_rows;
     std::vector<uint64_t> bytes(num_regions_);
     for (uint64_t i = 0; i < num_regions_; ++i) bytes[i] = region_rows(i) * rb_;
-    return t_.borrow(bytes, params_.connect_timeout_s, stop_);
+    return t_.borrow(bytes, params_.connect_timeout_s, stop_, granted_);
   }
 
   uint32_t reads_in_flight() const {
@@ -341,17 +386,26 @@ class RemoteSource final : public RemoteSourceBase {
   void loop() {
     std::vector<Read> reads;
     std::vector<UploadChunk> ups;
-    for (;;) {
-      const uint64_t kick = link_.kick.load();
-      const bool need_lock = t_.outstanding() == 0 || kick != seen_kick_ ||
-                             stop_.load() || (backlog_ && !get_free_.empty());
+    const bool busy = params_.busy_poll;
+    bool dozing = false;  // busy-polling, but parked after a long idle
+    double last_work = now_us();
+    for (uint32_t spins = 0;; ++spins) {
+      const bool mailed = busy && link_.mail.load(std::memory_order_acquire);
+      if (mailed) host_.plan_mailed();
+      const bool kicked = link_.kick.load() != seen_kick_;
+      const bool idle = (!busy || dozing) && t_.outstanding() == 0 && !backlog_;
+      const bool need_lock =
+          idle || kicked || stop_.load() || (backlog_ && !get_free_.empty());
       if (need_lock) {
         std::unique_lock<std::mutex> lk(host_.remote_mutex());
-        if (t_.outstanding() == 0)
+        if (idle) {
+          link_.parked.store(true);
           link_.cv.wait_for(lk, std::chrono::milliseconds(1), [&] {
             return host_.closed_locked() || stop_.load() ||
                    link_.kick.load() != seen_kick_;
           });
+          link_.parked.store(false);
+        }
         if (host_.closed_locked() || stop_.load()) return;
         seen_kick_ = link_.kick.load();
         if (!upload_error_.empty()) {
@@ -378,6 +432,7 @@ class RemoteSource final : public RemoteSourceBase {
       ups.clear();
       if (!reads.empty()) post_reads(reads);
       t_.progress();
+      const bool got = !t_.completions().empty();
       const std::string chunk_err = complete();
       const uint64_t sent = t_.requests();
       if (sent != link_.requests.load(std::memory_order_relaxed))
@@ -390,7 +445,17 @@ class RemoteSource final : public RemoteSourceBase {
         remote_fail(chunk_err);
         return;
       }
-      if (reads_in_flight() == 0 && t_.outstanding() > 0) wait_for_upload();
+      if (busy) {
+        if (mailed || kicked || got) {
+          dozing = false;
+          last_work = now_us();
+        } else if (spins % 1024 == 0 && now_us() - last_work > kIdleParkUs) {
+          dozing = true;
+        }
+        if (!need_lock && !got) cpu_relax();
+      } else if (reads_in_flight() == 0 && t_.outstanding() > 0) {
+        wait_for_upload();
+      }
     }
   }
 
@@ -490,7 +555,7 @@ class RemoteSource final : public RemoteSourceBase {
     }
     done_.clear();
     if (!delivered_.empty()) {
-      host_.complete_remote_reads(delivered_);
+      if (host_.complete_remote_reads(delivered_)) backlog_ = true;
       for (const auto& d : delivered_)
         get_free_.push_back(static_cast<uint32_t>((d.row - get_slab_) / rb_));
       delivered_.clear();
@@ -687,6 +752,7 @@ class RemoteSource final : public RemoteSourceBase {
   const uint64_t num_rows_;
   const bool direct_;
   std::atomic<bool> stop_{false};
+  std::atomic<uint64_t> granted_{0};  // regions granted so far
   std::thread remote_thread_, upload_thread_;
   std::condition_variable cv_setup_, cv_upload_;
   int wake_fd_ = -1;

@@ -240,10 +240,14 @@ class PLERemoteOptions:
         backend: Transport reaching the server, one of
             :data:`REMOTE_BACKENDS` or ``"loopback"`` (in-process, for tests);
             it must be in :func:`available_remote_backends`.
-        max_inflight: Remote row reads in flight.
+        max_inflight: Remote row reads in flight. Hint (prefetch) reads take
+            at most half of them (rounded down), so demand reads always find
+            a slot; with fewer than 2, hints are not prefetched remotely.
         region_bytes: Size of each region borrowed from the server.
         upload_chunk_bytes: Size of each staged upload read from the files.
-        connect_timeout_s: Bound on connecting and borrowing every region.
+        connect_timeout_s: Bound on connecting, and on the wait for each
+            borrowed region (the server populates a region before granting
+            it), not on the whole borrow.
         fallback_to_disk: On a remote failure, keep serving from the SSD
             instead of failing the affected reads.
         max_batch_rows: Most rows per read request (1 to 1024); queued rows
@@ -253,12 +257,18 @@ class PLERemoteOptions:
         allow_insecure_transport: Allow UCX's tcp transport. UCX's tcp
             transport writes data to any address a peer sends, so it is
             excluded unless allowed; only use it on a trusted network.
+        busy_poll: The thread driving the transport spins instead of
+            sleeping once set up (one core per reader, i.e. per GPU worker),
+            so it plans small demand jobs, sends their reads and picks up
+            replies without a wake-up. After about a second without remote
+            work it parks until the next one, which then pays one wake-up.
+            False sleeps whenever idle.
 
     """
 
     server: str
     backend: str = "ucx"
-    max_inflight: int = 256
+    max_inflight: int = 1024
     region_bytes: int = 1 << 30
     upload_chunk_bytes: int = 64 << 20
     connect_timeout_s: float = 30.0
@@ -266,6 +276,7 @@ class PLERemoteOptions:
     max_batch_rows: int = 256
     token_file: str | None = None
     allow_insecure_transport: bool = False
+    busy_poll: bool = True
 
 
 def _stream_handle(stream: "torch.cuda.Stream | int") -> int:
@@ -282,10 +293,18 @@ class PLEDiskReader:
         cache_rows: Row cache capacity in rows (0 disables the cache).
         io_threads: Number of blocking ``pread`` threads.
         max_inflight: Number of aligned read slots; the device queue depth is
-            ``min(io_threads, max_inflight)``.
+            ``min(io_threads, max_inflight)``, of which hint reads take at most
+            half (rounded down: none, and no SSD hint prefetch, below 2).
         direct_io: Use ``O_DIRECT``; falls back to buffered random reads when
             the filesystem rejects it.
         wait_timeout_s: Upper bound on any blocking wait for a demand job.
+        wait_spin_us: How long the stream's wait host function spins on the
+            demand job before sleeping until it completes.
+        inline_plan_rows: Largest demand job (rows) planned on the latency
+            path: by the busy-polling remote thread, or else by the notify
+            host function on the stream. Larger jobs (prefill chunks) are
+            planned by a planner thread so the stream does not wait for
+            them; 0 sends every job there.
         remote: Upload the table to a PLE memory server and serve rows from
             it once uploaded. The constructor waits for the connection; the
             upload runs in the background (see :meth:`remote_status`).
@@ -309,6 +328,8 @@ class PLEDiskReader:
         direct_io: bool,
         wait_timeout_s: float,
         remote: PLERemoteOptions | None = None,
+        wait_spin_us: float = 100.0,
+        inline_plan_rows: int = 1024,
     ) -> None:
         if not segments:
             raise ValueError("PLEDiskReader needs at least one segment")
@@ -349,6 +370,9 @@ class PLEDiskReader:
             remote.max_batch_rows if remote else 1,
             (remote.token_file or "") if remote else "",
             remote.allow_insecure_transport if remote else False,
+            remote.busy_poll if remote else False,
+            float(wait_spin_us),
+            inline_plan_rows,
         )
         self._finalizer = weakref.finalize(self, self._reader.close)
         self._maybe_warn_fallback()
@@ -440,6 +464,13 @@ class PLEDiskReader:
             raise RuntimeError(f"PLE disk reader error: {err}")
 
     def stats(self) -> dict[str, int | float | bool]:
+        """Returns counters and latency percentiles (us) since the last
+        :meth:`reset_stats`. ``demand_us_*``: per stream demand job, from its
+        notify host function to its last row delivered (to its cancellation
+        for a failed or timed-out one); ``demand_small_us_*``: the same for
+        jobs of at most 1024 rows (decode steps); ``wait_us_*`` and
+        ``demand_wait_us`` (total): time the stream's wait host function
+        blocked, spinning included."""
         stats = self._reader.stats()
         self._maybe_warn_fallback(stats)
         return stats

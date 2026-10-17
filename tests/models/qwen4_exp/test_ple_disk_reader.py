@@ -208,24 +208,80 @@ requires_cuda = pytest.mark.skipif(
 )
 
 
+LATENCY_KEYS = (
+    "demand_us_p50",
+    "demand_us_p99",
+    "demand_us_max",
+    "demand_small_us_p50",
+    "demand_small_us_p99",
+    "wait_us_p50",
+    "wait_us_p99",
+)
+
+
 @requires_cuda
-def test_notify_wait_on_stream(table):
+@pytest.mark.parametrize(
+    "wait_spin_us", [0.0, 100.0, 1e6], ids=["sleep", "default", "spin"]
+)
+def test_notify_wait_on_stream(table, wait_spin_us):
+    """The stream's wait returns only once every row landed, whether it
+    sleeps right away, spins then sleeps, or spins until the job is done
+    (then never sleeping); the step latencies are recorded and reset."""
     max_tokens, heads, n = 64, 16, 40
-    reader = _reader(table, cache_rows=1024)
+    reader = _reader(table, cache_rows=1024, wait_spin_us=wait_spin_us)
     try:
         _, (ids_v, num_v, out_v) = _bound_buffers(reader, max_tokens, heads)
-        ids = _mixed_ids(table, n * heads, 11)[: n * heads].reshape(n, heads)
-        src = torch.from_numpy(ids).cuda()
         stream = torch.cuda.current_stream()
-        ids_v[:n].copy_(src)
-        num_v.fill_(n)
-        reader.launch_notify(stream)
-        reader.launch_wait(stream)
-        result = out_v[:n].clone()
-        torch.accelerator.synchronize()
-        np.testing.assert_array_equal(
-            result.cpu().numpy(), _expected_tokens(table, ids)
-        )
+        for seed in (11, 12):
+            ids = _mixed_ids(table, n * heads, seed)[: n * heads].reshape(n, heads)
+            ids_v[:n].copy_(torch.from_numpy(ids).cuda())
+            num_v.fill_(n)
+            reader.launch_notify(stream)
+            reader.launch_wait(stream)
+            result = out_v[:n].clone()
+            torch.accelerator.synchronize()
+            np.testing.assert_array_equal(
+                result.cpu().numpy(), _expected_tokens(table, ids)
+            )
+        stats = reader.stats()
+        assert stats["demand_jobs"] == 2
+        assert 0 < stats["demand_us_p50"] <= stats["demand_us_max"]
+        assert stats["demand_small_us_p50"] == stats["demand_us_p50"]
+        counters = reader._reader.debug_counters()
+        assert counters["inline_plans"] == 2
+        if wait_spin_us >= 1e6:
+            assert counters["wait_sleeps"] == 0
+        reader.reset_stats()
+        assert all(reader.stats()[k] == 0 for k in LATENCY_KEYS)
+        reader.check_error()
+    finally:
+        reader.close()
+
+
+@requires_cuda
+def test_large_notify_jobs_planned_off_stream(table):
+    """The notify host function plans jobs of up to inline_plan_rows rows
+    itself and hands larger ones (prefill chunks) to the planner thread, so
+    the stream does not wait for their planning; both deliver every row."""
+    max_tokens, heads = 32, 16
+    reader = _reader(table, inline_plan_rows=64)
+    try:
+        _, (ids_v, num_v, out_v) = _bound_buffers(reader, max_tokens, heads)
+        stream = torch.cuda.current_stream()
+        for n, seed in ((4, 41), (32, 42)):  # 64 rows inline, 512 planner
+            ids = _mixed_ids(table, n * heads, seed)[: n * heads].reshape(n, heads)
+            ids_v[:n].copy_(torch.from_numpy(ids).cuda())
+            num_v.fill_(n)
+            reader.launch_notify(stream)
+            reader.launch_wait(stream)
+            result = out_v[:n].clone()
+            torch.accelerator.synchronize()
+            np.testing.assert_array_equal(
+                result.cpu().numpy(), _expected_tokens(table, ids)
+            )
+        counters = reader._reader.debug_counters()
+        assert counters["inline_plans"] == 1
+        assert counters["planner_plans"] == 1
         reader.check_error()
     finally:
         reader.close()
@@ -307,6 +363,38 @@ def test_truncated_file_reports_error(tmp_path):
             reader.launch_wait(stream)
             torch.accelerator.synchronize()
             assert time.monotonic() - start < 5
+    finally:
+        reader.close()
+
+
+def _wait_for(predicate, timeout_s: float = 10.0) -> None:
+    deadline = time.monotonic() + timeout_s
+    while not predicate():
+        assert time.monotonic() < deadline
+        time.sleep(0.01)
+
+
+def test_hint_slots_capped(table):
+    """Hint reads take at most half of the I/O slots (min(io_threads,
+    max_inflight)), so demand reads always find one; with a single slot no
+    hint is read at all (they are dropped) and demand reads still work."""
+    ids = np.arange(0, 30 * 3000, 30, dtype=np.int64)  # one row per page
+    reader = _reader(table, cache_rows=1 << 16, io_threads=8, max_inflight=64)
+    try:
+        reader.hint(ids)
+        _wait_for(lambda: reader.stats()["reads"] >= ids.size)
+        counters = reader._reader.debug_counters()
+        assert counters["disk_hint_cap"] == 4
+        assert 1 <= counters["disk_hint_peak"] <= 4
+    finally:
+        reader.close()
+    reader = _reader(table, cache_rows=4096, io_threads=1)
+    try:
+        reader.hint(ids[:100])
+        _wait_for(lambda: reader.stats()["hint_dropped"] == 100)
+        assert reader._reader.debug_counters()["disk_hint_cap"] == 0
+        assert reader.stats()["reads"] == 0
+        np.testing.assert_array_equal(_read(reader, ids[:50]), table.expected(ids[:50]))
     finally:
         reader.close()
 

@@ -105,13 +105,14 @@ class LoopbackTransport {
   }
 
   std::string borrow(const std::vector<uint64_t>& region_bytes, double,
-                     const std::atomic<bool>&) {
+                     const std::atomic<bool>&, std::atomic<uint64_t>& granted) {
     if (refuse_)
       return params_.address + " refused " +
              std::to_string(region_bytes.size()) + " regions";
     for (uint64_t bytes : region_bytes) {
       regions_.emplace_back(new uint8_t[bytes]);
       sizes_.push_back(bytes);
+      granted.fetch_add(1);
     }
     return "";
   }

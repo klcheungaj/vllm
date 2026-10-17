@@ -6,10 +6,10 @@
 // what the reader relies on: upload bandwidth (WRITE_REQ stream), the idle
 // round-trip latency of a one-row read (ping), the latency of fetching one
 // step's rows the way the reader does (N random rows as parallel READ_REQs of
-// at most --step-batch rows, timed until the last row arrives), and batched
-// reads at several batch sizes and depths with latency percentiles per
-// request and per row. `--probe` checks that the server rejects
-// out-of-bounds and foreign-region accesses.
+// at most B rows for each --step-batch B, timed until the last row arrives),
+// and batched reads at several batch sizes and depths with latency
+// percentiles per request and per row. `--probe` checks that the server
+// rejects out-of-bounds and foreign-region accesses.
 //
 // Needs only UCX; build with the Makefile next to this file.
 
@@ -53,7 +53,7 @@ struct Options {
   std::vector<uint32_t> depths{1, 4, 16};
   uint64_t ping_iters = 10000;
   std::vector<uint32_t> step_rows{16, 128, 256, 1024, 4096};
-  uint32_t step_batch = 256;
+  std::vector<uint32_t> step_batches{256};
   uint64_t step_iters = 2000;
   bool sweep = true;
   uint64_t iters = 20000;
@@ -88,8 +88,8 @@ void usage(const char* prog) {
       "                        0 skips the ping)\n"
       "  --step-rows N[,N..]   rows per simulated step (default\n"
       "                        16,128,256,1024,4096)\n"
-      "  --step-batch B        rows per READ_REQ within a step (default 256,\n"
-      "                        like remote_max_batch_rows)\n"
+      "  --step-batch B[,B..]  rows per READ_REQ within a step (default 256,\n"
+      "                        like remote_max_batch_rows); each B is timed\n"
       "  --step-iters N        steps to time per size (default 2000; 0 skips)\n"
       "  --verify              fill with an offset pattern, check every row\n"
       "  --probe               check that the server rejects out-of-bounds\n"
@@ -170,8 +170,7 @@ bool parse_args(int argc, char** argv, Options* o) {
     } else if (a == "--step-rows") {
       ok = list(&o->step_rows);
     } else if (a == "--step-batch") {
-      ok = size(&n) && n > 0 && n <= ple_mem::kMaxReadRows;
-      o->step_batch = static_cast<uint32_t>(n);
+      ok = list(&o->step_batches);
     } else if (a == "--step-iters") {
       ok = size(&o->step_iters);
     } else if (a == "--no-sweep") {
@@ -210,11 +209,11 @@ bool parse_args(int argc, char** argv, Options* o) {
   }
   uint32_t max_batch = 0;
   for (uint32_t b : o->batch_rows) max_batch = std::max(max_batch, b);
+  for (uint32_t b : o->step_batches) max_batch = std::max(max_batch, b);
   if (o->row_bytes == 0 || o->row_bytes > ple_mem::kMaxRowBytes ||
       o->region_bytes < o->row_bytes || o->bytes < o->region_bytes ||
       o->chunk_bytes == 0 || max_batch > ple_mem::kMaxReadRows ||
-      max_batch * o->row_bytes > ple_mem::kMaxReadReplyBytes ||
-      o->step_batch * o->row_bytes > ple_mem::kMaxReadReplyBytes) {
+      max_batch * o->row_bytes > ple_mem::kMaxReadReplyBytes) {
     std::fprintf(stderr,
                  "ple_mem_bench: need bytes >= region-bytes >= row-bytes, "
                  "row-bytes <= %u, chunk-bytes > 0 and batch-rows and "
@@ -289,6 +288,8 @@ class Bench {
  public:
   explicit Bench(const Options& o) : opt_(o) {
     for (uint32_t b : opt_.batch_rows) max_batch_ = std::max(max_batch_, b);
+    for (uint32_t b : opt_.step_batches)
+      max_step_batch_ = std::max(max_step_batch_, b);
     for (uint32_t d : opt_.depths) max_depth_ = std::max(max_depth_, d);
     for (uint32_t n : opt_.step_rows) max_step_ = std::max(max_step_, n);
     if (!opt_.token_file.empty()) {
@@ -310,8 +311,9 @@ class Bench {
     upload();
     if (opt_.ping_iters) ping_ = latency(1, 1, opt_.ping_iters);
     if (opt_.step_iters)
-      for (uint32_t n : opt_.step_rows)
-        steps_.push_back(latency(n, opt_.step_batch, opt_.step_iters));
+      for (uint32_t b : opt_.step_batches)
+        for (uint32_t n : opt_.step_rows)
+          steps_.push_back(latency(n, b, opt_.step_iters));
     if (opt_.sweep)
       for (uint32_t b : opt_.batch_rows)
         for (uint32_t d : opt_.depths) points_.push_back(reads(b, d));
@@ -335,7 +337,7 @@ class Bench {
     co.token = token_;
     co.allow_tcp = opt_.allow_tcp;
     co.read_tokens = std::max<uint32_t>(read_tokens, 1);
-    co.max_batch_rows = std::max(max_batch_, opt_.step_batch);
+    co.max_batch_rows = std::max(max_batch_, max_step_batch_);
     co.write_window = opt_.write_window;
     std::string err = c.open(co);
     if (!err.empty()) fail(err);
@@ -650,6 +652,7 @@ class Bench {
   Options opt_;
   std::string token_;
   uint32_t max_batch_ = 1;
+  uint32_t max_step_batch_ = 1;
   uint32_t max_depth_ = 1;
   uint32_t max_step_ = 1;
   // Buffers outlive client_ (declared first, destroyed last): a failed
