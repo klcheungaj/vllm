@@ -175,8 +175,10 @@ variable "VLLM_MERGE_BASE_COMMIT" {
   default = ""
 }
 
+# Neither Spark target inherits _labels: its index annotation cannot be
+# exported by the default docker driver for a single-platform image.
 target "openai-dgx-spark-base" {
-  inherits  = ["_common", "_labels"]
+  inherits  = ["_common"]
   target    = "vllm-openai"
   platforms = ["linux/arm64"]
   tags      = ["vllm:openai-dgx-spark-base"]
@@ -193,7 +195,6 @@ target "openai-dgx-spark-base" {
 }
 
 target "dgx-spark" {
-  inherits   = ["_labels"]
   dockerfile = "docker/Dockerfile.dgx_spark"
   context    = "."
   target     = "vllm-dgx-spark"
@@ -208,6 +209,8 @@ target "dgx-spark" {
     "org.opencontainers.image.source"      = "https://github.com/${GITHUB_REPOSITORY}"
     "org.opencontainers.image.title"       = "vLLM for DGX Spark"
     "org.opencontainers.image.description" = "vLLM for NVIDIA DGX Spark (CUDA 13) with Qwen4Exp PLE offload to a remote memory server over UCX"
+    "org.opencontainers.image.licenses"    = "Apache-2.0"
+    "org.opencontainers.image.revision"    = VLLM_BUILD_COMMIT
   }
   tags   = ["vllm:dgx-spark"]
   output = ["type=docker"]
