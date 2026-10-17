@@ -128,3 +128,64 @@ target "openai-ubuntu2404" {
   }
   output = ["type=docker"]
 }
+
+# DGX Spark (GB10, arm64, CUDA 13) with the PLE remote memory reader, and the
+# x86_64 PLE memory server. Build dgx-spark on the Spark itself:
+#   docker buildx bake -f docker/docker-bake.hcl dgx-spark
+#   docker buildx bake -f docker/docker-bake.hcl ple-mem-server
+
+variable "DGX_SPARK_BUILD_BASE_IMAGE" {
+  default = "pytorch/manylinuxaarch64-builder:cuda13.0-b8b5f17a7d9ccfc25bbc5cf17b3fcea12964a042"
+}
+
+# sm_121 runs the sm_12x family kernels built for 12.0 under CUDA 13.
+variable "DGX_SPARK_CUDA_ARCH_LIST" {
+  default = "12.0"
+}
+
+# The Spark's 20 cores share 128 GB with the GPU; keep nvcc's memory in check.
+variable "DGX_SPARK_MAX_JOBS" {
+  default = 8
+}
+
+variable "DGX_SPARK_NVCC_THREADS" {
+  default = 2
+}
+
+target "openai-dgx-spark-base" {
+  inherits  = ["_common", "_labels"]
+  target    = "vllm-openai"
+  platforms = ["linux/arm64"]
+  tags      = ["vllm:openai-dgx-spark-base"]
+  args = {
+    BUILD_BASE_IMAGE     = DGX_SPARK_BUILD_BASE_IMAGE
+    torch_cuda_arch_list = DGX_SPARK_CUDA_ARCH_LIST
+    max_jobs             = DGX_SPARK_MAX_JOBS
+    nvcc_threads         = DGX_SPARK_NVCC_THREADS
+  }
+}
+
+target "dgx-spark" {
+  inherits   = ["_labels"]
+  dockerfile = "docker/Dockerfile.dgx_spark"
+  context    = "."
+  target     = "vllm-dgx-spark"
+  platforms  = ["linux/arm64"]
+  contexts = {
+    "vllm:openai-dgx-spark-base" = "target:openai-dgx-spark-base"
+  }
+  args = {
+    max_jobs = DGX_SPARK_MAX_JOBS
+  }
+  tags   = ["vllm:dgx-spark"]
+  output = ["type=docker"]
+}
+
+target "ple-mem-server" {
+  dockerfile = "docker/Dockerfile.ple_mem_server"
+  context    = "."
+  target     = "ple-mem-server"
+  platforms  = ["linux/amd64"]
+  tags       = ["vllm-ple-mem-server:latest"]
+  output     = ["type=docker"]
+}

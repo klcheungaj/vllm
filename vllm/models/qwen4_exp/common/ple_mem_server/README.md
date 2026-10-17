@@ -25,6 +25,11 @@ make UCX_HOME=/opt/ucx       # UCX install prefix (adds an rpath)
 make OUT=/tmp/ple            # put the binaries elsewhere
 ```
 
+`tools/install_ucx_from_source.sh` builds a suitable UCX (verbs, rdmacm and
+mlx5, no GPU support, release configuration). `docker/Dockerfile.ple_mem_server`
+packages the server for x86_64 without CUDA; see
+[the Engram guide](../../../../../docs/features/engram.md#docker-images).
+
 ## Run the server
 
 ```bash
@@ -36,7 +41,7 @@ make OUT=/tmp/ple            # put the binaries elsewhere
 | --- | --- | --- |
 | `--host` | required | Listen address: the RDMA / storage interface the vLLM hosts reach (`0.0.0.0` = every interface) |
 | `--port` | `18515` | Listen port (`0` picks a free one, logged at startup) |
-| `--max-memory` | `auto` | Cap on lent memory in mapped bytes (K/M/G/T suffixes); `auto` = 90% of MemAvailable at startup |
+| `--max-memory` | `auto` | Cap on lent memory in mapped bytes (K/M/G/T suffixes); `auto` = 90% of MemAvailable at startup, within the cgroup (container) memory limit |
 | `--max-regions` | `16384` | Regions lent in total |
 | `--max-client-regions` | `4096` | Regions per client |
 | `--token-file` | none | Shared secret clients must send (file content, surrounding whitespace trimmed, at most 256 bytes) |

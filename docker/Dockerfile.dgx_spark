@@ -1,0 +1,106 @@
+# vLLM for NVIDIA DGX Spark (GB10: aarch64 Grace + sm_121, CUDA 13) with the
+# Qwen4Exp PLE n-gram table offloaded to SSD or to a PLE memory server over
+# UCX (RoCEv2 on the Spark's ConnectX-7); see docs/features/engram.md.
+#
+# Layers on the vllm-openai image that docker/Dockerfile builds for
+# linux/arm64 and adds: UCX with verbs, rdmacm and mlx5 (without CUDA: the
+# reader moves rows through pinned host memory, so no GPUDirect RDMA or
+# nvidia-peermem is involved), the RDMA user-space libraries, g++ for the PLE
+# reader's JIT build, the prebuilt reader extensions and ple_mem_bench.
+#
+# Build on the Spark itself (an x86 host would emulate arm64), from the
+# repository root, with bake:
+#   docker buildx bake -f docker/docker-bake.hcl dgx-spark
+# or with two builds:
+#   docker buildx build --platform linux/arm64 -f docker/Dockerfile \
+#       --target vllm-openai --build-arg torch_cuda_arch_list=12.0 \
+#       --build-arg BUILD_BASE_IMAGE=<aarch64 builder, see docker-bake.hcl> \
+#       --build-arg max_jobs=8 --build-arg nvcc_threads=2 \
+#       -t vllm:openai-dgx-spark-base --load .
+#   docker buildx build --platform linux/arm64 -f docker/Dockerfile.dgx_spark \
+#       -t vllm:dgx-spark --load .
+#
+# Run (host network so the RoCE interfaces and GIDs are visible):
+#   docker run --gpus all --ipc=host --network host \
+#       --device /dev/infiniband --ulimit memlock=-1 \
+#       -e UCX_NET_DEVICES=<device>:1 -v <model dir>:/model \
+#       vllm:dgx-spark /model --engram-config '{"remote_memory_server": ...}'
+
+ARG BASE_IMAGE=vllm:openai-dgx-spark-base
+# Must match the Ubuntu release of BASE_IMAGE (docker/Dockerfile's
+# UBUNTU_VERSION), which runs the UCX built here.
+ARG UBUNTU_VERSION=24.04
+
+#################### UCX BUILD ####################
+FROM ubuntu:${UBUNTU_VERSION} AS ucx-build
+
+ARG UCX_VERSION=v1.22.0
+ARG UCX_CONFIGURE_FLAGS=""
+ARG max_jobs=""
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update -y \
+    && apt-get install -y --no-install-recommends \
+        autoconf \
+        automake \
+        ca-certificates \
+        g++ \
+        git \
+        libibverbs-dev \
+        librdmacm-dev \
+        libtool \
+        make \
+        pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY tools/install_ucx_from_source.sh /tmp/install_ucx_from_source.sh
+RUN UCX_VERSION="${UCX_VERSION}" UCX_CONFIGURE_FLAGS="${UCX_CONFIGURE_FLAGS}" \
+    MAX_JOBS="${max_jobs}" bash /tmp/install_ucx_from_source.sh /opt/ucx
+
+COPY vllm/models/qwen4_exp/common/ple_mem_server /tmp/ple_mem_server
+RUN make -C /tmp/ple_mem_server -B UCX_HOME=/opt/ucx OUT=/opt/ple_mem/bin \
+        /opt/ple_mem/bin/ple_mem_bench
+
+#################### vLLM FOR DGX SPARK ####################
+FROM ${BASE_IMAGE} AS vllm-dgx-spark
+
+# Build the PLE reader extensions into the image so the first start does
+# not compile them; the build needs no GPU.
+ARG PREBUILD_PLE_EXTENSIONS=true
+
+# g++ (and ninja, from vLLM's requirements) JIT-build the PLE reader, whose
+# UCX variant finds UCX with pkg-config. ibverbs-providers carries
+# the mlx5 user-space driver for the ConnectX-7; the -utils packages pull in
+# libibverbs and librdmacm and add ibv_devinfo / rping for checking the RDMA
+# setup.
+RUN apt-get update -y \
+    && apt-get install -y --no-install-recommends \
+        g++ \
+        ibverbs-providers \
+        ibverbs-utils \
+        pkg-config \
+        rdmacm-utils \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=ucx-build /opt/ucx /opt/ucx
+COPY --from=ucx-build /opt/ple_mem/bin /opt/ple_mem/bin
+RUN if ldd /opt/ple_mem/bin/* /opt/ucx/lib/ucx/*.so | grep "not found"; then \
+        exit 1; \
+    fi
+
+# The reader links UCX with an rpath, so LD_LIBRARY_PATH is left alone.
+# UCX_HOME would work too, but UCX warns about every UCX_* variable it does
+# not know. The JIT cache lives in the image, group-writable for the
+# non-root user.
+ENV PKG_CONFIG_PATH=/opt/ucx/lib/pkgconfig \
+    PATH=/opt/ple_mem/bin:/opt/ucx/bin:${PATH} \
+    TORCH_EXTENSIONS_DIR=/opt/vllm/torch_extensions
+
+RUN mkdir -p "${TORCH_EXTENSIONS_DIR}" \
+    && if [ "${PREBUILD_PLE_EXTENSIONS}" = "true" ]; then \
+        python3 -c "import vllm.models.qwen4_exp.common.ple_disk_reader as r; \
+            r.load_extension(); r.load_extension(remote=True); \
+            assert 'ucx' in r.available_remote_backends()"; \
+    fi \
+    && chgrp -R 0 "${TORCH_EXTENSIONS_DIR}" \
+    && chmod -R g+rwX "${TORCH_EXTENSIONS_DIR}"

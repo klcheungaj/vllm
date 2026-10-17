@@ -331,7 +331,8 @@ containers.
 **Memory sizing.** The server must be able to lend the whole table: about
 51 GB for Qwen3.8-Flash-Next, plus a little rounding per region (each region
 holds whole rows). By default it lends at most 90% of the memory available
-when it starts; set `--max-memory` to cap it explicitly, and
+when it starts (within its cgroup memory limit when it runs in a
+container); set `--max-memory` to cap it explicitly, and
 `--max-regions`/`--max-client-regions` to bound the region count.
 On a multi-socket server, run it on the NUMA node the NIC is attached to
 (`cat /sys/class/net/<dev>/device/numa_node`), with its memory there too,
@@ -356,6 +357,85 @@ this protocol on an unmodified UCX: UCX's own wire protocol trusts its peer,
 so a deliberately modified UCX peer may still crash or corrupt the vLLM
 process. See
 [the security guide](../usage/security.md#ple-memory-server) for details.
+
+#### Docker images
+
+Two images package this setup; build them from the repository root:
+
+```bash
+# On the DGX Spark (arm64; an x86 host would have to emulate it):
+docker buildx bake -f docker/docker-bake.hcl dgx-spark
+# For the memory server (x86_64, no CUDA):
+docker buildx bake -f docker/docker-bake.hcl ple-mem-server
+```
+
+- `docker/Dockerfile.dgx_spark` layers on the `vllm-openai` image that
+  `docker/Dockerfile` builds for linux/arm64 and CUDA 13 (the
+  `openai-dgx-spark-base` bake target). It adds UCX built by
+  `tools/install_ucx_from_source.sh` (verbs, rdmacm and mlx5, without CUDA
+  support, since rows travel through pinned host memory and need no
+  GPUDirect RDMA), the RDMA user-space libraries, g++ for the reader's JIT
+  build, `ple_mem_bench`, and the reader extensions prebuilt in
+  `TORCH_EXTENSIONS_DIR=/opt/vllm/torch_extensions`. The reader finds that
+  UCX through `PKG_CONFIG_PATH` (setting `UCX_HOME` instead makes UCX warn
+  about an unknown `UCX_*` variable). Leave `INSTALL_KV_CONNECTORS` off for this
+  image: connectors that bundle their own UCX would share one UCX library
+  with the reader in the same process.
+- `docker/Dockerfile.ple_mem_server` contains the same UCX, the RDMA
+  user-space libraries, `ple_mem_server` and `ple_mem_bench` on Ubuntu,
+  runs as an unprivileged user, and passes its arguments to
+  `ple_mem_server`.
+
+Both NICs, the Spark's ConnectX-7 and a ConnectX-6 Dx on the server, use the
+mlx5 driver and UCX's `rc_mlx5` transport over RoCEv2, so the images need no
+NIC-specific build. The kernel driver (inbox or DOCA-OFED) stays on the
+host; the images carry only rdma-core's user-space part. Run both containers
+with `--network host` (RoCE addresses and GIDs belong to the host's
+interfaces), `--device /dev/infiniband` and `--ulimit memlock=-1`:
+
+```bash
+# Memory server, pinned to the NIC's NUMA node with Docker's cpuset flags
+# (numactl's memory binding would need extra capabilities):
+docker run -d --name ple-mem-server --network host \
+    --device /dev/infiniband --ulimit memlock=-1 \
+    --cpuset-cpus 0-9 --cpuset-mems 0 \
+    -e UCX_NET_DEVICES=mlx5_0:1 \
+    -v /etc/ple_mem.token:/run/ple_mem.token:ro \
+    vllm-ple-mem-server --host 10.0.0.2 --max-memory 60G \
+    --token-file /run/ple_mem.token
+
+# DGX Spark: check the link first, then serve.
+docker run --rm --network host --device /dev/infiniband \
+    --ulimit memlock=-1 -e UCX_NET_DEVICES=<device>:1 \
+    -v /etc/ple_mem.token:/run/ple_mem.token:ro --entrypoint ple_mem_bench \
+    vllm:dgx-spark --server 10.0.0.2:18515 --bytes 4G \
+    --token-file /run/ple_mem.token
+docker run --gpus all --ipc=host --network host \
+    --device /dev/infiniband --ulimit memlock=-1 \
+    -e UCX_NET_DEVICES=<device>:1 -v /models:/models \
+    -v /etc/ple_mem.token:/run/ple_mem.token:ro \
+    vllm:dgx-spark /models/Qwen3.8-Flash-Next \
+    --engram-config.disk_offload true \
+    --engram-config.remote_memory_server 10.0.0.2:18515 \
+    --engram-config.remote_token_file /run/ple_mem.token
+```
+
+Host settings the containers cannot make:
+
+- `UCX_NET_DEVICES`: the Spark's ConnectX-7 appears as several RDMA
+  devices, one per port and PCIe link; `rdma link show` on the host maps
+  each to its network interface, so pick the one that is cabled to the
+  server. `ucx_info -d` inside a container lists what UCX sees. UCX selects
+  a RoCEv2 GID by itself; set `UCX_IB_GID_INDEX` only if that fails.
+- MTU: set the RoCE interfaces (and the switch) to MTU 9000 so RoCE runs
+  with 4 KiB packets, and configure the network for RoCE (PFC or ECN) as for
+  any RDMA traffic.
+- The server's huge pages are transparent huge pages requested with
+  `madvise`; `/sys/kernel/mm/transparent_hugepage/enabled` on the server
+  host must be `madvise` or `always`.
+- `--cpuset-mems` confines the server's memory to one NUMA node, which
+  `--max-memory auto` does not account for: pass a `--max-memory` that fits
+  in that node's free memory.
 
 ## Data-parallel topologies (DeepSeek V4.1)
 

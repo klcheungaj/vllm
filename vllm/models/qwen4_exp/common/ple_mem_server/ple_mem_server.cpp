@@ -102,7 +102,8 @@ void usage(const char* prog) {
       "  --port PORT            listen port (default 18515, 0 picks one)\n"
       "  --max-memory BYTES     cap on lent memory (mapped bytes), K/M/G/T\n"
       "                         suffixes, or auto = 90%% of MemAvailable at\n"
-      "                         startup (default auto)\n"
+      "                         startup, within the cgroup (container) memory\n"
+      "                         limit (default auto)\n"
       "  --max-regions N        regions lent in total (default 16384)\n"
       "  --max-client-regions N regions per client (default 4096)\n"
       "  --token-file PATH      require this shared secret from clients\n"
@@ -293,7 +294,7 @@ class Server {
     if (opt_.max_memory == 0) {
       const uint64_t avail = ple_mem::mem_available();
       if (avail == 0) {
-        log_msg("cannot read MemAvailable; pass --max-memory explicitly");
+        log_msg("no available memory found; pass --max-memory explicitly");
         return false;
       }
       opt_.max_memory = avail / 10 * 9;

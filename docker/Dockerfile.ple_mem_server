@@ -1,0 +1,85 @@
+# PLE memory server: lends RAM to vLLM hosts that offload the Qwen4Exp PLE
+# n-gram table (see docs/features/engram.md). Contains only UCX (RDMA through
+# verbs, rdmacm and mlx5, e.g. ConnectX-6 Dx over RoCEv2), the RDMA user-space
+# libraries, ple_mem_server and ple_mem_bench: no CUDA, Python or vLLM.
+#
+# Build from the repository root:
+#   docker build --platform linux/amd64 -f docker/Dockerfile.ple_mem_server \
+#       -t vllm-ple-mem-server .
+#
+# Run on the memory server (host network so the RoCE interfaces and GIDs are
+# visible; the NIC's kernel driver comes from the host):
+#   docker run -d --name ple-mem-server --network host \
+#       --device /dev/infiniband --ulimit memlock=-1 \
+#       --cpuset-cpus <NIC node CPUs> --cpuset-mems <NIC node> \
+#       -e UCX_NET_DEVICES=mlx5_0:1 \
+#       vllm-ple-mem-server --host <RoCE interface IP> --max-memory 60G
+#
+# Arguments go to ple_mem_server (`--help` lists them). The image runs as an
+# unprivileged user; pass `--user 0` if /dev/infiniband is not accessible to
+# other users on the host.
+
+ARG UBUNTU_VERSION=24.04
+
+#################### BUILD ####################
+FROM ubuntu:${UBUNTU_VERSION} AS build
+
+ARG UCX_VERSION=v1.22.0
+ARG UCX_CONFIGURE_FLAGS=""
+ARG max_jobs=""
+# Portable x86-64 by default; e.g. add -march=ivybridge for a Xeon E5 v2.
+ARG PLE_CXXFLAGS="-O2 -std=c++17 -Wall -Wextra"
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update -y \
+    && apt-get install -y --no-install-recommends \
+        autoconf \
+        automake \
+        ca-certificates \
+        g++ \
+        git \
+        libibverbs-dev \
+        librdmacm-dev \
+        libtool \
+        make \
+        pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY tools/install_ucx_from_source.sh /tmp/install_ucx_from_source.sh
+RUN UCX_VERSION="${UCX_VERSION}" UCX_CONFIGURE_FLAGS="${UCX_CONFIGURE_FLAGS}" \
+    MAX_JOBS="${max_jobs}" bash /tmp/install_ucx_from_source.sh /opt/ucx
+
+COPY vllm/models/qwen4_exp/common/ple_mem_server /tmp/ple_mem_server
+RUN make -C /tmp/ple_mem_server -B UCX_HOME=/opt/ucx OUT=/opt/ple_mem/bin \
+        CXXFLAGS="${PLE_CXXFLAGS}"
+
+#################### RUNTIME ####################
+FROM ubuntu:${UBUNTU_VERSION} AS ple-mem-server
+
+ENV DEBIAN_FRONTEND=noninteractive
+# ibverbs-providers carries the mlx5 user-space driver (ConnectX-4 and
+# newer); the -utils packages pull in libibverbs and librdmacm and add
+# ibv_devinfo / rping for checking the RDMA setup.
+RUN apt-get update -y \
+    && apt-get install -y --no-install-recommends \
+        ibverbs-providers \
+        ibverbs-utils \
+        numactl \
+        rdmacm-utils \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=build /opt/ucx/bin /opt/ucx/bin
+COPY --from=build /opt/ucx/lib /opt/ucx/lib
+COPY --from=build /opt/ple_mem/bin /opt/ple_mem/bin
+RUN rm -rf /opt/ucx/lib/pkgconfig /opt/ucx/lib/cmake \
+    && if ldd /opt/ple_mem/bin/* /opt/ucx/lib/ucx/*.so | grep "not found"; then \
+        exit 1; \
+    fi
+ENV PATH=/opt/ple_mem/bin:/opt/ucx/bin:${PATH}
+
+RUN useradd --uid 2000 --gid 0 --no-create-home --shell /usr/sbin/nologin ple
+USER ple
+
+EXPOSE 18515
+ENTRYPOINT ["ple_mem_server"]
+CMD ["--help"]

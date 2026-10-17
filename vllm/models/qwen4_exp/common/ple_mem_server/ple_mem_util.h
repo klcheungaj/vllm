@@ -11,6 +11,7 @@
 #include <sys/socket.h>
 #include <ucp/api/ucp.h>
 
+#include <algorithm>
 #include <cerrno>
 #include <cmath>
 #include <cstdint>
@@ -155,14 +156,46 @@ inline bool constant_time_equal(const std::string& a, const char* b,
   return diff == 0;
 }
 
-// MemAvailable from /proc/meminfo in bytes, 0 if unknown.
+// Reads a decimal byte count such as a cgroup memory file; false for "max".
+inline bool read_u64_file(const char* path, uint64_t* out) {
+  std::ifstream f(path);
+  std::string s;
+  if (!(f >> s)) return false;
+  char* end = nullptr;
+  errno = 0;
+  const unsigned long long v = std::strtoull(s.c_str(), &end, 10);
+  if (errno != 0 || end == s.c_str() || *end != '\0') return false;
+  *out = v;
+  return true;
+}
+
+// Bytes this process's cgroup (v2, else v1) memory limit still allows, or
+// UINT64_MAX without a limit. /proc/meminfo ignores container limits.
+inline uint64_t cgroup_memory_headroom() {
+  static const char* const kFiles[][2] = {
+      {"/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory.current"},
+      {"/sys/fs/cgroup/memory/memory.limit_in_bytes",
+       "/sys/fs/cgroup/memory/memory.usage_in_bytes"},
+  };
+  for (const auto& files : kFiles) {
+    uint64_t limit = 0, usage = 0;
+    if (!read_u64_file(files[0], &limit)) continue;
+    if (!read_u64_file(files[1], &usage)) usage = 0;
+    return limit > usage ? limit - usage : 0;
+  }
+  return UINT64_MAX;
+}
+
+// MemAvailable from /proc/meminfo in bytes, capped by the cgroup memory
+// limit's headroom; 0 if unknown.
 inline uint64_t mem_available() {
   std::ifstream f("/proc/meminfo");
   std::string key;
   uint64_t kib = 0;
   std::string unit;
   while (f >> key >> kib >> unit)
-    if (key == "MemAvailable:") return kib * 1024;
+    if (key == "MemAvailable:")
+      return std::min(kib * 1024, cgroup_memory_headroom());
   return 0;
 }
 
