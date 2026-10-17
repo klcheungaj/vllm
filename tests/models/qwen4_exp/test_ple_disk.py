@@ -349,3 +349,113 @@ def test_disk_embedding_replays_under_cuda_graph(tmp_path, single_rank):
         expected = _expected_rows(table, ids[:num_tokens]).to(torch.bfloat16) * 0.5
         assert torch.equal(output[:num_tokens].cpu(), expected)
     embedding.check_error()
+
+
+_REMOTE_SERVER = "10.0.0.2:18515"
+
+
+class _FakeRemoteReader:
+    """Native reader stand-in whose remote source is scripted by the test."""
+
+    def __init__(self, segments, row_bytes, **options):
+        self.options = options
+        self.status = {
+            "state": "uploading",
+            "uploaded_bytes": 4_000_000_000,
+            "total_bytes": 16_000_000_000,
+            "regions": 16,
+            "error": "",
+        }
+        self.status_polls = 0
+        self.resets = 0
+
+    def bind_demand(self, *buffers):
+        pass
+
+    def check_error(self):
+        pass
+
+    def remote_status(self):
+        self.status_polls += 1
+        return dict(self.status)
+
+    def stats(self):
+        return {
+            **dict.fromkeys(["requests", "cache_hits", "reads", "bytes"], 0),
+            **dict.fromkeys(["demand_wait_us", "demand_jobs", "hint_rows"], 0),
+            "hint_dropped": 0,
+            "read_us_p50": 0.0,
+            "read_us_p99": 0.0,
+            "direct_io": True,
+            "remote_reads": 40,
+            "remote_bytes": 6400,
+            "remote_read_us_p50": 5.0,
+            "remote_read_us_p99": 9.0,
+            "remote_requeued": 0,
+        }
+
+    def reset_stats(self):
+        self.resets += 1
+
+
+@pytest.fixture
+def remote_embedding(tmp_path, single_rank, monkeypatch):
+    import vllm.models.qwen4_exp.common.ple_disk_reader as reader_module
+
+    engram_config = EngramConfig(
+        disk_offload=True, remote_memory_server=_REMOTE_SERVER, remote_max_inflight=32
+    )
+    monkeypatch.setattr(
+        ple_disk_module,
+        "get_current_vllm_config",
+        lambda: SimpleNamespace(engram_config=engram_config),
+    )
+    monkeypatch.setattr(reader_module, "PLEDiskReader", _FakeRemoteReader)
+    embedding, _ = _make_disk_embedding(tmp_path, fp8=False)
+    return embedding
+
+
+@requires_uva
+def test_remote_options_reach_reader(remote_embedding):
+    from vllm.models.qwen4_exp.common.ple_disk_reader import PLERemoteOptions
+
+    expected = PLERemoteOptions(server=_REMOTE_SERVER, max_inflight=32)
+    assert remote_embedding.reader.options["remote"] == expected
+
+
+@requires_uva
+@pytest.mark.parametrize(
+    "state, level, message",
+    [
+        ("ready", "INFO", "is ready: uploaded 16.0 GB"),
+        ("failed", "WARNING", "failed: peer gone; continuing with SSD reads"),
+    ],
+)
+def test_remote_transition_logged_once(
+    remote_embedding, caplog_vllm, state, level, message
+):
+    """Steps stop polling the remote status once the upload has settled."""
+    reader = remote_embedding.reader
+    remote_embedding.check_error()
+    reader.status.update(state=state, uploaded_bytes=16_000_000_000, error="peer gone")
+    for _ in range(3):
+        remote_embedding.check_error()
+    polls = reader.status_polls
+    remote_embedding.check_error()
+
+    assert reader.status_polls == polls
+    records = [r for r in caplog_vllm.records if message in r.getMessage()]
+    assert [r.levelname for r in records] == [level]
+
+
+@requires_uva
+def test_remote_stats_report_upload_progress(remote_embedding, caplog_vllm):
+    remote_embedding.log_and_reset_stats(60.0)
+
+    assert remote_embedding.reader.resets == 1
+    (message,) = [
+        r.getMessage() for r in caplog_vllm.records if "PLE disk" in r.getMessage()
+    ]
+    assert "remote uploading: 40 reads" in message
+    assert "p50 5 us p99 9 us" in message
+    assert "uploaded 4.0 of 16.0 GB" in message

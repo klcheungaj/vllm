@@ -3,6 +3,7 @@
 
 from typing import TYPE_CHECKING
 
+import regex as re
 from pydantic import Field, model_validator
 from typing_extensions import Self
 
@@ -32,8 +33,32 @@ _DISK_TUNABLE_FIELDS = frozenset(
         "disk_prefetch_hints",
         "disk_wait_timeout_s",
         "disk_stats_interval_s",
+        "remote_memory_server",
+        "remote_max_inflight",
+        "remote_region_bytes",
+        "remote_upload_chunk_bytes",
+        "remote_connect_timeout_s",
+        "remote_fallback_to_disk",
     }
 )
+_HOST_PORT_RE = re.compile(r"\[([^\[\]\s]+)\]:(\d{1,5})|([^:\[\]\s]+):(\d{1,5})")
+
+
+def _parse_host_port(address: str) -> tuple[str, int]:
+    """Split a ``host:port`` or ``[ipv6]:port`` address.
+
+    Raises:
+        ValueError: If the address is malformed or the port is out of range.
+
+    """
+    match = _HOST_PORT_RE.fullmatch(address)
+    port = int(match[2] or match[4]) if match else 0
+    if match is None or not 1 <= port <= 65535:
+        raise ValueError(
+            "remote_memory_server must be 'host:port' or '[ipv6]:port' with a "
+            f"port in 1..65535, got {address!r}"
+        )
+    return match[1] or match[3], port
 
 
 def model_has_engram_layers(model_config: "ModelConfig | None") -> bool:
@@ -99,6 +124,30 @@ class EngramConfig:
     """Seconds between disk offload reader statistics log lines (row-cache
     hit rate, SSD reads, read latency, per-step wait); 0 disables them."""
 
+    remote_memory_server: str | None = None
+    """Address ("host:port" or "[ipv6]:port") of a PLE memory server to
+    borrow RAM from over UCX. The table is uploaded there from the checkpoint
+    in the background and rows are then read with one-sided RDMA instead of
+    from the SSD. Requires disk_offload."""
+
+    remote_max_inflight: int = Field(default=256, ge=1)
+    """Maximum outstanding row reads from the remote memory server."""
+
+    remote_region_bytes: int = Field(default=1 << 30, ge=1 << 20)
+    """Size of each memory region borrowed from the remote memory server."""
+
+    remote_upload_chunk_bytes: int = Field(default=64 << 20, ge=1 << 20)
+    """Size of each staging buffer used to upload the table to the remote
+    memory server."""
+
+    remote_connect_timeout_s: float = Field(default=30.0, gt=0)
+    """Seconds to wait for connecting to the remote memory server and
+    borrowing its regions."""
+
+    remote_fallback_to_disk: bool = True
+    """Keep serving rows from the SSD when the remote memory server cannot be
+    reached or fails later; otherwise such a failure is fatal."""
+
     @model_validator(mode="after")
     def _validate_shared_memory(self) -> Self:
         if self.disk_offload and (self.dp_shared_memory or self.use_thp):
@@ -111,6 +160,10 @@ class EngramConfig:
             raise ValueError(
                 "use_thp requires cpu_offload=True and dp_shared_memory=False"
             )
+        if self.remote_memory_server is not None:
+            if not self.disk_offload:
+                raise ValueError("remote_memory_server requires disk_offload=True")
+            _parse_host_port(self.remote_memory_server)
         return self
 
     def verify_model_config(self, model_config: "ModelConfig | None") -> None:

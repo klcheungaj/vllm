@@ -153,6 +153,27 @@ def test_hint_fills_cache(table):
         reader.close()
 
 
+def test_cache_keeps_hot_row(table):
+    """CLOCK replacement: a row hit between every cold insert stays resident
+    in a single 8-way set even after many more cold rows than ways."""
+    reader = _reader(table, cache_rows=8)
+    try:
+        hot = np.array([7], dtype=np.int64)
+        _read(reader, hot)
+        reader.reset_stats()
+        cold = np.arange(1000, NUM_ROWS, 4999, dtype=np.int64)[:32]
+        for row in cold:
+            np.testing.assert_array_equal(
+                _read(reader, np.array([row])), table.expected(np.array([row]))
+            )
+            np.testing.assert_array_equal(_read(reader, hot), table.expected(hot))
+        stats = reader.stats()
+        assert stats["cache_hits"] == cold.size
+        assert stats["reads"] == cold.size
+    finally:
+        reader.close()
+
+
 def test_large_batch(table):
     reader = _reader(table, cache_rows=8192, io_threads=16, max_inflight=256)
     try:

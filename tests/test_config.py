@@ -1737,6 +1737,12 @@ def test_engram_disk_tunables_keep_compile_hash():
         disk_prefetch_hints=False,
         disk_wait_timeout_s=1.0,
         disk_stats_interval_s=0.0,
+        remote_memory_server="10.0.0.2:18515",
+        remote_max_inflight=8,
+        remote_region_bytes=1 << 20,
+        remote_upload_chunk_bytes=1 << 20,
+        remote_connect_timeout_s=1.0,
+        remote_fallback_to_disk=False,
     )
     assert tuned.compute_hash() == EngramConfig(disk_offload=True).compute_hash()
 
@@ -1751,11 +1757,36 @@ def test_engram_disk_tunables_keep_compile_hash():
         {"disk_max_inflight": 0},
         {"disk_wait_timeout_s": 0.0},
         {"disk_stats_interval_s": -1.0},
+        {"remote_max_inflight": 0},
+        {"remote_region_bytes": (1 << 20) - 1},
+        {"remote_upload_chunk_bytes": (1 << 20) - 1},
+        {"remote_connect_timeout_s": 0.0},
     ],
 )
 def test_engram_disk_offload_rejects_invalid_options(options):
     with pytest.raises(ValidationError):
         EngramConfig(disk_offload=True, **options)
+
+
+@pytest.mark.parametrize("server", ["10.0.0.2:18515", "mem-host:1", "[fe80::1]:65535"])
+def test_engram_remote_memory_server_accepts_addresses(server):
+    assert EngramConfig(disk_offload=True).remote_memory_server is None
+    config = EngramConfig(disk_offload=True, remote_memory_server=server)
+    assert config.remote_memory_server == server
+
+
+@pytest.mark.parametrize(
+    "server", ["mem-host", "mem-host:0", "mem-host:65536", ":18515", "fe80::1:1"]
+)
+def test_engram_remote_memory_server_rejects_bad_addresses(server):
+    with pytest.raises(ValueError, match="must be 'host:port'"):
+        EngramConfig(disk_offload=True, remote_memory_server=server)
+
+
+def test_engram_remote_memory_server_requires_disk_offload():
+    """The checkpoint files are the upload source and the fallback."""
+    with pytest.raises(ValueError, match="requires disk_offload=True"):
+        EngramConfig(remote_memory_server="10.0.0.2:18515")
 
 
 @pytest.mark.parametrize(

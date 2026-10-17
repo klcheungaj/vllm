@@ -8,10 +8,19 @@ allows it) by a pool of I/O threads, cached in a set-associative row cache,
 and delivered either synchronously (:meth:`PLEDiskReader.read_rows`) or from
 CUDA host functions acting on bound pinned buffers, which keeps the path
 capturable in CUDA graphs.
+
+With :class:`PLERemoteOptions`, the table is also uploaded to RAM borrowed
+from a standalone PLE memory server (``ple_mem_server/README.md``) over UCX
+and rows are read back with one-sided GETs; that variant of the extension is
+built against UCX.
 """
 
 import functools
+import os
+import shutil
+import subprocess
 import threading
+import time
 import weakref
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -27,31 +36,93 @@ logger = init_logger(__name__)
 
 _SOURCE = Path(__file__).parent / "csrc" / "ple_disk_reader.cpp"
 _BUILD_LOCK = threading.Lock()
+_UCX_HINT = (
+    "Install UCX (e.g. `apt install libucx-dev` or a source build) and set "
+    "UCX_HOME to its install prefix, or make `pkg-config ucx` work."
+)
+
+
+def ucx_build_flags() -> tuple[list[str], list[str]]:
+    """Returns ``(cflags, ldflags)`` for compiling against UCX.
+
+    Looks at ``UCX_HOME`` (``include/`` and ``lib/``) first, then
+    ``pkg-config ucx``, then the system headers. ``ldflags`` carry an rpath
+    to the UCX library directory when it is known.
+
+    Raises:
+        RuntimeError: If UCX cannot be found.
+
+    """
+    libs = ["-lucp", "-luct", "-lucs"]
+    home = os.environ.get("UCX_HOME")
+    if home:
+        inc, lib = Path(home) / "include", Path(home) / "lib"
+        if not (inc / "ucp" / "api" / "ucp.h").is_file():
+            raise RuntimeError(f"UCX_HOME={home} has no include/ucp/api/ucp.h")
+        return [f"-I{inc}"], [f"-L{lib}", f"-Wl,-rpath,{lib}", *libs]
+    if shutil.which("pkg-config"):
+        try:
+            cflags = subprocess.run(
+                ["pkg-config", "--cflags", "ucx"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.split()
+            lib_dir = subprocess.run(
+                ["pkg-config", "--variable=libdir", "ucx"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+        except subprocess.CalledProcessError:
+            pass
+        else:
+            ldflags = [f"-L{lib_dir}", f"-Wl,-rpath,{lib_dir}"] if lib_dir else []
+            return cflags, ldflags + libs
+    if Path("/usr/include/ucp/api/ucp.h").is_file():
+        return [], libs
+    raise RuntimeError(f"UCX was not found. {_UCX_HINT}")
 
 
 @functools.cache
-def _build_extension() -> Any:
+def _build_extension(with_ucx: bool) -> Any:
     from torch.utils.cpp_extension import load
 
+    cflags = ["-O3", "-std=c++17"]
+    ldflags = ["-ldl", "-lpthread"]
+    name = "vllm_ple_disk_reader"
+    if with_ucx:
+        ucx_cflags, ucx_ldflags = ucx_build_flags()
+        cflags += ["-DPLE_WITH_UCX", *ucx_cflags]
+        ldflags += ucx_ldflags
+        name += "_ucx"
     try:
         return load(
-            name="vllm_ple_disk_reader",
+            name=name,
             sources=[str(_SOURCE)],
-            extra_cflags=["-O3", "-std=c++17"],
-            extra_ldflags=["-ldl", "-lpthread"],
+            extra_cflags=cflags,
+            extra_ldflags=ldflags,
         )
     except Exception as e:
+        hint = f" {_UCX_HINT}" if with_ucx else ""
         raise RuntimeError(
             "Failed to build the PLE disk reader extension. PLE disk offload "
             "JIT-compiles a small C++ extension and needs a C++ compiler "
-            f"(g++) and ninja to be installed: {e}"
+            f"(g++) and ninja to be installed{' plus UCX' if with_ucx else ''}:"
+            f" {e}{hint}"
         ) from e
 
 
-def load_extension() -> Any:
-    """Builds (once per process) and returns the native extension module."""
+def load_extension(with_ucx: bool = False) -> Any:
+    """Builds (once per process) and returns the native extension module.
+
+    Args:
+        with_ucx: Build the variant with the remote memory source, compiled
+            against UCX (see :func:`ucx_build_flags`).
+
+    """
     with _BUILD_LOCK:
-        return _build_extension()
+        return _build_extension(with_ucx)
 
 
 @dataclass(frozen=True)
@@ -72,6 +143,30 @@ class PLEDiskSegment:
     num_rows: int
 
 
+@dataclass(frozen=True)
+class PLERemoteOptions:
+    """Remote memory source of a :class:`PLEDiskReader`.
+
+    Attributes:
+        server: PLE memory server address, ``"host:port"`` or
+            ``"[ipv6]:port"``.
+        max_inflight: Remote GETs in flight.
+        region_bytes: Size of each region borrowed from the server.
+        upload_chunk_bytes: Size of each staged upload read from the files.
+        connect_timeout_s: Bound on connecting and borrowing every region.
+        fallback_to_disk: On a remote failure, keep serving from the SSD
+            instead of failing the affected reads.
+
+    """
+
+    server: str
+    max_inflight: int = 256
+    region_bytes: int = 1 << 30
+    upload_chunk_bytes: int = 64 << 20
+    connect_timeout_s: float = 30.0
+    fallback_to_disk: bool = True
+
+
 def _stream_handle(stream: "torch.cuda.Stream | int") -> int:
     return stream if isinstance(stream, int) else int(stream.cuda_stream)
 
@@ -90,6 +185,13 @@ class PLEDiskReader:
         direct_io: Use ``O_DIRECT``; falls back to buffered random reads when
             the filesystem rejects it.
         wait_timeout_s: Upper bound on any blocking wait for a demand job.
+        remote: Upload the table to a PLE memory server and serve rows from
+            it once uploaded. The constructor waits for the connection; the
+            upload runs in the background (see :meth:`remote_status`).
+
+    Raises:
+        RuntimeError: If ``remote`` is set, the server cannot be used and
+            ``remote.fallback_to_disk`` is false.
 
     """
 
@@ -103,6 +205,7 @@ class PLEDiskReader:
         max_inflight: int,
         direct_io: bool,
         wait_timeout_s: float,
+        remote: PLERemoteOptions | None = None,
     ) -> None:
         if not segments:
             raise ValueError("PLEDiskReader needs at least one segment")
@@ -117,7 +220,7 @@ class PLEDiskReader:
         self._requested_direct = direct_io
         self._warned_fallback = False
         self._bound: tuple[torch.Tensor, ...] | None = None
-        ext = load_extension()
+        ext = load_extension(with_ucx=remote is not None)
         self._reader = ext.Reader(
             paths,
             [index[s.path] for s in segments],
@@ -130,6 +233,12 @@ class PLEDiskReader:
             max_inflight,
             direct_io,
             float(wait_timeout_s),
+            remote.server if remote else "",
+            remote.max_inflight if remote else 1,
+            remote.region_bytes if remote else 1,
+            remote.upload_chunk_bytes if remote else 1,
+            float(remote.connect_timeout_s) if remote else 1.0,
+            remote.fallback_to_disk if remote else True,
         )
         self._finalizer = weakref.finalize(self, self._reader.close)
         self._maybe_warn_fallback()
@@ -222,6 +331,31 @@ class PLEDiskReader:
 
     def reset_stats(self) -> None:
         self._reader.reset_stats()
+
+    def remote_status(self) -> dict[str, Any]:
+        """Returns the remote source status.
+
+        Keys: ``state`` (``"disabled"``, ``"connecting"``, ``"uploading"``,
+        ``"ready"`` or ``"failed"``), ``uploaded_bytes``, ``total_bytes``,
+        ``regions`` and ``error`` (``""`` if none).
+        """
+        return self._reader.remote_status()
+
+    def wait_remote_ready(self, timeout_s: float | None = None) -> bool:
+        """Waits until the upload finished or the remote source failed.
+
+        Returns:
+            True if the remote source is ready.
+
+        """
+        deadline = None if timeout_s is None else time.monotonic() + timeout_s
+        while True:
+            state = self._reader.remote_status()["state"]
+            if state in ("ready", "failed", "disabled"):
+                return state == "ready"
+            if deadline is not None and time.monotonic() >= deadline:
+                return False
+            time.sleep(0.01)
 
     def close(self) -> None:
         """Stops the I/O threads and frees buffers. Idempotent."""

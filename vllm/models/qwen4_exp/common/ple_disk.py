@@ -13,6 +13,7 @@ import glob
 import json
 import os
 import struct
+import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, ClassVar
 
@@ -294,6 +295,8 @@ class Qwen4ExpPLEDiskEmbedding(Qwen4ExpPLEEmbedding):
         )
         self.reader: PLEDiskReader | None = None
         self._disk_segments: list[PLEDiskSegmentSpec] = []
+        self._remote_state = "disabled"
+        self._remote_opened_at = 0.0
 
     def allocate_embedding_weight(
         self,
@@ -317,7 +320,7 @@ class Qwen4ExpPLEDiskEmbedding(Qwen4ExpPLEEmbedding):
         """Index this layer's checkpoint shards and start the row reader."""
         from vllm.model_executor.models.utils import extract_layer_index
 
-        from .ple_disk_reader import PLEDiskReader, PLEDiskSegment
+        from .ple_disk_reader import PLEDiskReader, PLEDiskSegment, PLERemoteOptions
 
         specs = find_ple_disk_segments(
             model_dir,
@@ -336,6 +339,17 @@ class Qwen4ExpPLEDiskEmbedding(Qwen4ExpPLEEmbedding):
                 "files is not supported"
             )
         config = self.engram_config
+        remote = None
+        if config.remote_memory_server is not None:
+            remote = PLERemoteOptions(
+                server=config.remote_memory_server,
+                max_inflight=config.remote_max_inflight,
+                region_bytes=config.remote_region_bytes,
+                upload_chunk_bytes=config.remote_upload_chunk_bytes,
+                connect_timeout_s=config.remote_connect_timeout_s,
+                fallback_to_disk=config.remote_fallback_to_disk,
+            )
+        self._remote_opened_at = time.monotonic()
         reader = PLEDiskReader(
             [
                 PLEDiskSegment(spec.path, spec.offset, spec.row_start, spec.num_rows)
@@ -347,6 +361,7 @@ class Qwen4ExpPLEDiskEmbedding(Qwen4ExpPLEEmbedding):
             max_inflight=config.disk_max_inflight,
             direct_io=config.disk_direct_io,
             wait_timeout_s=config.disk_wait_timeout_s,
+            remote=remote,
         )
         reader.bind_demand(self._ids, self._num_tokens, self._staging)
         self.reader = reader
@@ -361,6 +376,19 @@ class Qwen4ExpPLEDiskEmbedding(Qwen4ExpPLEEmbedding):
             config.disk_row_cache_rows,
             reader.stats().get("direct_io"),
         )
+        if remote is not None:
+            status = reader.remote_status()
+            self._remote_state = "connecting"
+            logger.info(
+                "PLE remote memory for %s: server %s, %d region(s), %.1f GB to "
+                "upload, state %s, fallback_to_disk=%s",
+                self.prefix,
+                remote.server,
+                int(status["regions"]),
+                int(status["total_bytes"]) / 1e9,
+                status["state"],
+                remote.fallback_to_disk,
+            )
 
     def hint_rows(self, rows: np.ndarray) -> None:
         """Advise the reader of rows a later step will need."""
@@ -369,8 +397,34 @@ class Qwen4ExpPLEDiskEmbedding(Qwen4ExpPLEEmbedding):
 
     def check_error(self) -> None:
         """Raise any I/O failure recorded by the reader."""
-        if self.reader is not None:
-            self.reader.check_error()
+        if self.reader is None:
+            return
+        if self._remote_state in ("connecting", "uploading"):
+            self._note_remote_status(self.reader.remote_status())
+        self.reader.check_error()
+
+    def _note_remote_status(self, status: dict[str, Any]) -> None:
+        """Log the remote source becoming ready or failing, once each."""
+        state = status["state"]
+        if state == self._remote_state:
+            return
+        self._remote_state = state
+        if state == "ready":
+            logger.info(
+                "PLE remote memory for %s is ready: uploaded %.1f GB in %.0fs",
+                self.prefix,
+                int(status["uploaded_bytes"]) / 1e9,
+                time.monotonic() - self._remote_opened_at,
+            )
+        elif state == "failed":
+            logger.warning(
+                "PLE remote memory for %s failed: %s; %s",
+                self.prefix,
+                status["error"],
+                "continuing with SSD reads"
+                if self.engram_config.remote_fallback_to_disk
+                else "SSD fallback is disabled, so reads of uploaded rows fail",
+            )
 
     def log_and_reset_stats(self, interval_s: float) -> None:
         """Log the reader statistics gathered since the previous call."""
@@ -380,10 +434,12 @@ class Qwen4ExpPLEDiskEmbedding(Qwen4ExpPLEEmbedding):
         self.reader.reset_stats()
         requests = int(stats["requests"])
         jobs = max(1, int(stats["demand_jobs"]))
-        logger.info(
+        fmt = (
             "PLE disk %s over %.0fs: %d rows requested, %.1f%% row-cache hits, "
             "%d SSD reads (%.1f MB), read p50 %.0f us p99 %.0f us, "
-            "%.0f us average wait per step, %d hinted rows (%d dropped)",
+            "%.0f us average wait per step, %d hinted rows (%d dropped)"
+        )
+        args: list[Any] = [
             self.prefix,
             interval_s,
             requests,
@@ -395,7 +451,29 @@ class Qwen4ExpPLEDiskEmbedding(Qwen4ExpPLEEmbedding):
             float(stats["demand_wait_us"]) / jobs,
             int(stats["hint_rows"]),
             int(stats["hint_dropped"]),
-        )
+        ]
+        if self._remote_state != "disabled":
+            status = self.reader.remote_status()
+            self._note_remote_status(status)
+            fmt += (
+                ", remote %s: %d reads (%.1f MB), p50 %.0f us p99 %.0f us, "
+                "%d moved to SSD"
+            )
+            args += [
+                status["state"],
+                int(stats["remote_reads"]),
+                int(stats["remote_bytes"]) / 1e6,
+                stats["remote_read_us_p50"],
+                stats["remote_read_us_p99"],
+                int(stats["remote_requeued"]),
+            ]
+            if status["state"] == "uploading":
+                fmt += ", uploaded %.1f of %.1f GB"
+                args += [
+                    int(status["uploaded_bytes"]) / 1e9,
+                    int(status["total_bytes"]) / 1e9,
+                ]
+        logger.info(fmt, *args)
 
     def start_prefetch(
         self,

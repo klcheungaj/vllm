@@ -147,6 +147,118 @@ Disk offload requires CUDA (the ROCm Qwen4Exp implementation does not support
 it) with tensor, data, and pipeline parallel sizes of 1, and is incompatible
 with `dp_shared_memory` and `use_thp`.
 
+### Remote memory offload
+
+When another machine on the network has spare RAM, disk offload can borrow
+it over UCX (RDMA over RoCEv2 in production) and serve rows from there
+instead of from the SSD:
+
+1. A PLE memory server runs on the machine lending the RAM. It knows nothing
+   about models; it only hands out registered memory regions.
+2. At startup, vLLM connects to it, borrows enough regions for the PLE table,
+   and uploads the table from the local checkpoint files in the background.
+   Serving starts right away; rows that are not uploaded yet are still read
+   from the SSD.
+3. Once uploaded, rows missing from the local row cache are fetched with
+   one-sided RDMA reads, which need no CPU on the server. The row cache
+   (`disk_row_cache_rows`) still applies in front of the remote reads.
+
+The checkpoint files stay the upload source and the fallback: with
+`remote_fallback_to_disk` (the default), vLLM keeps reading from the SSD if
+the server cannot be reached at startup or fails later, for the rest of the
+run.
+
+Start the memory server first. It is a standalone program that depends only
+on UCX, not on vLLM or Python: copy the
+`vllm/models/qwen4_exp/common/ple_mem_server/` directory to the machine
+lending the RAM and build it with a C++17 compiler and the UCX development
+files:
+
+```bash
+make -C ple_mem_server            # finds UCX with pkg-config
+make -C ple_mem_server UCX_HOME=/opt/ucx   # or from a UCX install prefix
+./ple_mem_server/ple_mem_server --port 18515 --max-memory 64G --hugepages
+```
+
+| Server flag | Default | Meaning |
+| --- | --- | --- |
+| `--host` | `0.0.0.0` | Address to listen on. |
+| `--port` | `18515` | Port to listen on. |
+| `--max-memory` | `0` | Maximum bytes lent in total (`K`/`M`/`G`/`T` suffixes); `0` means no limit. |
+| `--busy-poll` | off | Spin instead of sleeping between events; lowers latency of the TCP transport at the cost of a CPU core. |
+| `--hugepages` | off | Back regions with transparent huge pages. |
+| `--verbose` | off | Log more detail to stderr. |
+
+The same directory builds `ple_mem_bench`, a standalone client that measures
+the link before vLLM uses it: upload bandwidth, large-read bandwidth, and the
+rate and latency (p50/p99/p99.9) of random row-sized reads at several queue
+depths. Run it from the vLLM machine with the same UCX environment:
+
+```bash
+./ple_mem_server/ple_mem_bench --server 10.0.0.2:18515 --bytes 4G \
+  --row-bytes 160 --depth 1,16,64,256 --seconds 5
+```
+
+`--verify` checks every read against the uploaded pattern and `--json`
+prints machine-readable results; see the directory's `README.md` for all
+flags.
+
+Then point vLLM at it:
+
+```bash
+vllm serve <qwen4exp-checkpoint> \
+  --engram-config.disk_offload true \
+  --engram-config.remote_memory_server 10.0.0.2:18515
+```
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `remote_memory_server` | `None` | `host:port` (or `[ipv6]:port`) of the memory server; requires `disk_offload`. |
+| `remote_max_inflight` | `256` | Maximum outstanding remote row reads. |
+| `remote_region_bytes` | `1073741824` | Size of each borrowed memory region. |
+| `remote_upload_chunk_bytes` | `67108864` | Size of each staging buffer used for the upload. |
+| `remote_connect_timeout_s` | `30.0` | Seconds to wait for connecting and borrowing the regions. |
+| `remote_fallback_to_disk` | `true` | Keep reading from the SSD when the server is unreachable or fails; otherwise such a failure is fatal. |
+
+Like the disk knobs, these do not affect the compilation cache. vLLM logs
+when the upload completes (size and duration) or when the remote source
+fails, and the periodic `PLE disk ...` line adds remote reads, remote read
+latency, and the upload progress while it runs.
+
+**UCX.** With `remote_memory_server` set, the row reader is compiled against
+UCX, so the vLLM machine needs the UCX headers and libraries (for example
+the distribution's `libucx-dev` package, or the UCX bundled with
+MLNX_OFED/DOCA). vLLM finds them through `UCX_HOME` (with `include/` and
+`lib/` below it) or `pkg-config ucx`. The server needs the same UCX
+libraries.
+
+**RoCEv2.** UCX picks the transport and device from its environment; set
+the same variables for vLLM and the server, for example:
+
+```bash
+export UCX_NET_DEVICES=mlx5_0:1   # the RDMA device and port to use
+export UCX_IB_GID_INDEX=3         # the RoCEv2 GID of that port (see show_gids)
+export UCX_TLS=rc,tcp
+```
+
+`ucx_info -d` lists the available devices and transports. `UCX_TLS=tcp`
+alone also works, without RDMA hardware, but UCX then emulates the remote
+reads in software: they are slower and need CPU on the server.
+
+**Containers.** No `--privileged` flag is needed. Pass the RDMA devices with
+`--device /dev/infiniband`, lift the locked-memory limit with
+`--ulimit memlock=-1`, and typically use `--network host` so the RoCE
+interfaces and their GIDs are visible, for both the vLLM and the server
+containers.
+
+**Memory sizing.** The server must be able to lend the whole table: about
+51 GB for Qwen3.8-Flash-Next, plus a little rounding per region (each region
+holds whole rows). Use `--max-memory` to cap what one server lends.
+
+**Security.** Run the memory server only on a trusted network. It has no
+authentication, UCX traffic is not encrypted, and any peer holding a
+region's remote key can read and write the borrowed memory.
+
 ## Data-parallel topologies (DeepSeek V4.1)
 
 By default (`embedding_across_dp: false`), each DP replica keeps its own
@@ -197,3 +309,5 @@ IPC namespace across the co-located replicas.
   unsupported with elastic expert parallelism.
 - `disk_offload` is Qwen4Exp-only and requires CUDA with TP, DP, and PP sizes
   of 1.
+- `remote_memory_server` requires `disk_offload`, UCX on both machines, and a
+  trusted network; the memory server is unauthenticated.
