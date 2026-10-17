@@ -18,7 +18,7 @@ UCX_LIBS := -lucp -luct -lucs -lucm
 endif
 endif
 
-HEADERS := ple_mem_protocol.h ple_mem_util.h
+HEADERS := ple_mem_protocol.h ple_mem_util.h ple_mem_client.h
 BINS := $(OUT)/ple_mem_server $(OUT)/ple_mem_bench
 
 all: $(BINS)

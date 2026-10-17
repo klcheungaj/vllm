@@ -10,11 +10,12 @@ CUDA host functions acting on bound pinned buffers, which keeps the path
 capturable in CUDA graphs.
 
 With :class:`PLERemoteOptions`, the table is also uploaded to RAM borrowed
-from a memory server and rows are read back with one-sided GETs
-(``csrc/ple_remote_source.h``). The remote variant of the extension compiles
-in every backend whose dependencies are available (e.g. ``ucx``, reaching the
-standalone PLE memory server in ``ple_mem_server/README.md``); the reader
-picks one of them by name when it starts.
+from a memory server and rows are read back with batched read requests
+(``csrc/ple_remote_source.h``). The server only answers requests and the
+reader exposes none of its memory to it (see ``ple_mem_server/README.md``).
+The remote variant of the extension compiles in every backend whose
+dependencies are available (e.g. ``ucx``, reaching the standalone PLE memory
+server); the reader picks one of them by name when it starts.
 """
 
 import functools
@@ -234,17 +235,24 @@ class PLERemoteOptions:
     Attributes:
         server: Memory server address in the backend's format: ``"host:port"``
             or ``"[ipv6]:port"`` for ``ucx``; ``"loopback"`` optionally
-            followed by ``?fail_after=N&refuse=1&delay_us=D`` for
+            followed by ``?fail_after=N&refuse=1&delay_us=D&corrupt=M`` for
             ``loopback``.
         backend: Transport reaching the server, one of
             :data:`REMOTE_BACKENDS` or ``"loopback"`` (in-process, for tests);
             it must be in :func:`available_remote_backends`.
-        max_inflight: Remote GETs in flight.
+        max_inflight: Remote row reads in flight.
         region_bytes: Size of each region borrowed from the server.
         upload_chunk_bytes: Size of each staged upload read from the files.
         connect_timeout_s: Bound on connecting and borrowing every region.
         fallback_to_disk: On a remote failure, keep serving from the SSD
             instead of failing the affected reads.
+        max_batch_rows: Most rows per read request (1 to 1024); queued rows
+            are sent at once, split into requests of at most this many.
+        token_file: File holding the shared secret the server was started
+            with (``--token-file``), or None.
+        allow_insecure_transport: Allow UCX's tcp transport. UCX's tcp
+            transport writes data to any address a peer sends, so it is
+            excluded unless allowed; only use it on a trusted network.
 
     """
 
@@ -255,6 +263,9 @@ class PLERemoteOptions:
     upload_chunk_bytes: int = 64 << 20
     connect_timeout_s: float = 30.0
     fallback_to_disk: bool = True
+    max_batch_rows: int = 256
+    token_file: str | None = None
+    allow_insecure_transport: bool = False
 
 
 def _stream_handle(stream: "torch.cuda.Stream | int") -> int:
@@ -335,6 +346,9 @@ class PLEDiskReader:
             remote.upload_chunk_bytes if remote else 1,
             float(remote.connect_timeout_s) if remote else 1.0,
             remote.fallback_to_disk if remote else True,
+            remote.max_batch_rows if remote else 1,
+            (remote.token_file or "") if remote else "",
+            remote.allow_insecure_transport if remote else False,
         )
         self._finalizer = weakref.finalize(self, self._reader.close)
         self._maybe_warn_fallback()
@@ -409,8 +423,13 @@ class PLEDiskReader:
         self._reader.launch(_stream_handle(stream), False)
 
     def launch_wait(self, stream: "torch.cuda.Stream | int") -> None:
-        """Enqueues a host function blocking ``stream`` until the latest
-        notified demand job completes (or fails / times out)."""
+        """Enqueues a host function blocking ``stream`` until the demand job
+        of the matching :meth:`launch_notify` completes.
+
+        Fails closed: if that job failed or timed out, or no notify preceded
+        the wait, the stream cannot continue with valid rows, so the host
+        function prints the error to stderr and aborts the process.
+        """
         self._reader.launch(_stream_handle(stream), True)
 
     def check_error(self) -> None:

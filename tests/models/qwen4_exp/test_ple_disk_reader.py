@@ -2,7 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Tests for the on-demand PLE n-gram table reader (disk offload)."""
 
+import subprocess
 import sys
+import textwrap
+import threading
 import time
 
 import numpy as np
@@ -294,6 +297,7 @@ def test_truncated_file_reports_error(tmp_path):
             reader.check_error()
 
         if torch.cuda.is_available():
+            reader._reader.set_abort_on_stream_failure(False)
             (ids, num, out), _ = _bound_buffers(reader, 4, 2)
             ids.fill_(rows - 1)
             num.fill_(4)
@@ -305,3 +309,128 @@ def test_truncated_file_reports_error(tmp_path):
             assert time.monotonic() - start < 5
     finally:
         reader.close()
+
+
+def test_hint_accepts_up_to_inbox_capacity(table):
+    """A hint larger than the inbox is truncated, not dropped whole."""
+    reader = _reader(table, cache_rows=1024)
+    try:
+        n = (1 << 20) + 1000
+        reader.hint(np.arange(n, dtype=np.int64) % NUM_ROWS)
+        stats = reader.stats()
+        assert stats["hint_rows"] == n
+        assert stats["hint_dropped"] == 1000
+    finally:
+        reader.close()
+
+
+def test_too_many_files(tmp_path):
+    segments = [
+        PLEDiskSegment(str(tmp_path / f"{i}.bin"), 0, i, 1) for i in range(2048)
+    ]
+    with pytest.raises(ValueError, match="at most 2047 table files"):
+        PLEDiskReader(
+            segments,
+            ROW_BYTES,
+            cache_rows=0,
+            io_threads=1,
+            max_inflight=1,
+            direct_io=False,
+            wait_timeout_s=1.0,
+        )
+
+
+def _read_until_closed(
+    reader: PLEDiskReader, table: _Table, seed: int, errors: list[BaseException]
+) -> None:
+    ids = _mixed_ids(table, 3000, seed)
+    expected = table.expected(ids)
+    try:
+        while True:
+            np.testing.assert_array_equal(_read(reader, ids), expected)
+            reader.hint(ids[:100])
+            reader.stats()
+    except BaseException as e:
+        errors.append(e)
+
+
+def test_close_racing_read_rows(table):
+    """close() from another thread while readers are blocked or planning:
+    every read either completes exactly or raises 'closed'; nothing crashes
+    and close waits for the callers before freeing the cache."""
+    for attempt in range(5):
+        reader = _reader(table, cache_rows=4096, io_threads=2, max_inflight=4)
+        errors: list[BaseException] = []
+        threads = [
+            threading.Thread(
+                target=_read_until_closed,
+                args=(reader, table, attempt * 10 + i, errors),
+            )
+            for i in range(4)
+        ]
+        for t in threads:
+            t.start()
+        time.sleep(0.05 * (attempt + 1))
+        reader.close()
+        for t in threads:
+            t.join(30)
+            assert not t.is_alive()
+        assert len(errors) == len(threads)
+        assert all(
+            isinstance(e, RuntimeError) and "closed" in str(e) for e in errors
+        ), errors
+
+
+@requires_cuda
+def test_wait_without_notify_fails_closed(table):
+    """A wait without a matching notify must not let the stream continue on
+    the previous step's rows (recorded here instead of aborting)."""
+    reader = _reader(table, cache_rows=0)
+    try:
+        reader._reader.set_abort_on_stream_failure(False)
+        (ids, num, _), _ = _bound_buffers(reader, 4, 2)
+        num.fill_(4)
+        stream = torch.cuda.current_stream()
+        reader.launch_notify(stream)
+        reader.launch_wait(stream)
+        torch.accelerator.synchronize()
+        reader.check_error()
+        reader.launch_wait(stream)
+        torch.accelerator.synchronize()
+        with pytest.raises(RuntimeError, match="without a matching notify"):
+            reader.check_error()
+    finally:
+        reader.close()
+
+
+@requires_cuda
+def test_failed_stream_wait_aborts(tmp_path):
+    """By default a failed demand job aborts the process from the stream's
+    wait host function, with the error on stderr."""
+    path = tmp_path / "short.bin"
+    path.write_bytes(b"\0" * (ROW_BYTES * 10))
+    script = textwrap.dedent(
+        f"""
+        import torch
+        from vllm.models.qwen4_exp.common.ple_disk_reader import (
+            PLEDiskReader, PLEDiskSegment)
+        reader = PLEDiskReader(
+            [PLEDiskSegment({str(path)!r}, 0, 0, 1000)], {ROW_BYTES},
+            cache_rows=0, io_threads=1, max_inflight=4, direct_io=False,
+            wait_timeout_s=10.0)
+        ids = torch.full((4, 2), 999, dtype=torch.int64).pin_memory()
+        num = torch.full((1,), 4, dtype=torch.int64).pin_memory()
+        out = torch.zeros(4, 2 * {ROW_BYTES}, dtype=torch.uint8).pin_memory()
+        reader.bind_demand(ids, num, out)
+        reader.launch_notify(0)  # legacy default stream
+        reader.launch_wait(0)
+        torch.accelerator.synchronize()
+        print("survived")
+        """
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", script], capture_output=True, text=True, timeout=300
+    )
+    assert proc.returncode != 0
+    assert "survived" not in proc.stdout
+    assert "FATAL: vLLM PLE disk reader: short read" in proc.stderr

@@ -1448,7 +1448,10 @@ package_data = {
         "distributed/kv_transfer/kv_connector/v1/hf3fs/utils/*.cpp",
         "models/qwen4_exp/common/csrc/*.cpp",
         "models/qwen4_exp/common/csrc/*.h",
-        "models/qwen4_exp/common/ple_mem_server/*",
+        "models/qwen4_exp/common/ple_mem_server/*.h",
+        "models/qwen4_exp/common/ple_mem_server/*.cpp",
+        "models/qwen4_exp/common/ple_mem_server/Makefile",
+        "models/qwen4_exp/common/ple_mem_server/README.md",
         # Built-in multimodal chat template fallbacks (registry.py)
         "transformers_utils/chat_templates/*.jinja",
         "third_party/flash_linear_attention/LICENSE",

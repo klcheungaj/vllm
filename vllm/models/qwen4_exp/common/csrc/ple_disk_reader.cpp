@@ -33,6 +33,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <deque>
@@ -67,6 +68,11 @@ constexpr size_t kLatencyRing = 65536;
 constexpr size_t kCacheStripes = 1024;
 constexpr size_t kHintInboxRows = size_t{1} << 20;
 constexpr size_t kHintQueueReads = size_t{1} << 16;
+// Disk read keys pack the file index above bit 52 below kRemoteKey.
+constexpr size_t kMaxFiles = 2047;
+constexpr int64_t kMaxInflight = int64_t{1} << 16;
+constexpr int64_t kMaxIoThreads = 1024;
+constexpr int64_t kMaxBatchRows = 1024;
 
 using ple_remote::now_us;
 
@@ -162,11 +168,15 @@ struct Use {
   uint64_t row;
   uint32_t in_page;
   uint8_t* dst;
-  JobPtr job;  // null for hint-only uses
+  JobPtr job;         // null for hint-only uses
+  bool live = false;  // set while delivering: the job takes the bytes
 };
 
-// A page read from the SSD or, when `remote`, a one-row GET from the memory
-// server (`offset` then holds the row).
+class ReadPool;
+
+// A page read from the SSD or, when `remote`, a one-row read from the memory
+// server (`offset` then holds the row). Pooled and intrusively counted, so
+// the read path allocates nothing once warm.
 struct PageRead {
   uint64_t key = 0;
   uint32_t file = 0;
@@ -177,8 +187,80 @@ struct PageRead {
   bool finished = false;
   bool demand = false;
   std::vector<Use> uses;
+  std::atomic<uint32_t> refs{0};
+  ReadPool* pool = nullptr;
 };
-using ReadPtr = std::shared_ptr<PageRead>;
+
+class ReadPtr {
+ public:
+  ReadPtr() = default;
+  ReadPtr(std::nullptr_t) {}
+  explicit ReadPtr(PageRead* p) : p_(p) { p_->refs.fetch_add(1); }
+  ReadPtr(const ReadPtr& o) : p_(o.p_) {
+    if (p_ != nullptr) p_->refs.fetch_add(1);
+  }
+  ReadPtr(ReadPtr&& o) noexcept : p_(o.p_) { o.p_ = nullptr; }
+  ReadPtr& operator=(ReadPtr o) noexcept {
+    std::swap(p_, o.p_);
+    return *this;
+  }
+  ~ReadPtr() { reset(); }
+  inline void reset();
+  PageRead* operator->() const { return p_; }
+  PageRead& operator*() const { return *p_; }
+  PageRead* get() const { return p_; }
+  explicit operator bool() const { return p_ != nullptr; }
+  bool operator==(const ReadPtr& o) const { return p_ == o.p_; }
+
+ private:
+  PageRead* p_ = nullptr;
+};
+
+class ReadPool {
+ public:
+  ReadPool() = default;
+  ReadPool(const ReadPool&) = delete;
+  ReadPool& operator=(const ReadPool&) = delete;
+  ~ReadPool() {
+    for (PageRead* p : free_) delete p;
+  }
+
+  ReadPtr make() {
+    PageRead* p = nullptr;
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      if (!free_.empty()) {
+        p = free_.back();
+        free_.pop_back();
+      }
+    }
+    if (p == nullptr) {
+      p = new PageRead();
+      p->pool = this;
+    }
+    return ReadPtr(p);
+  }
+
+  // Last reference dropped: reset and keep for reuse (uses keep capacity).
+  void recycle(PageRead* p) {
+    p->uses.clear();
+    p->key = p->offset = 0;
+    p->file = p->length = 0;
+    p->remote = p->started = p->finished = p->demand = false;
+    std::lock_guard<std::mutex> lk(mu_);
+    free_.push_back(p);
+  }
+
+ private:
+  std::mutex mu_;
+  std::vector<PageRead*> free_;
+};
+
+inline void ReadPtr::reset() {
+  if (p_ != nullptr && p_->refs.fetch_sub(1, std::memory_order_acq_rel) == 1)
+    p_->pool->recycle(p_);
+  p_ = nullptr;
+}
 
 struct Miss {
   uint64_t key;
@@ -257,16 +339,24 @@ class Core {
        bool direct_io, double wait_timeout_s, const std::string& remote_server,
        const std::string& remote_backend, int64_t remote_max_inflight,
        int64_t remote_region_bytes, int64_t remote_upload_chunk_bytes,
-       double remote_connect_timeout_s, bool remote_fallback_to_disk)
+       double remote_connect_timeout_s, bool remote_fallback_to_disk,
+       int64_t remote_max_batch_rows, const std::string& remote_token_file,
+       bool remote_allow_insecure_transport)
       : rb_(static_cast<uint32_t>(row_bytes)),
         timeout_us_(wait_timeout_s * 1e6) {
     if (row_bytes <= 0 || row_bytes > static_cast<int64_t>(kPage))
       throw std::invalid_argument("row_bytes must be in [1, 4096]");
-    if (io_threads <= 0 || max_inflight <= 0 || cache_rows < 0)
+    if (io_threads <= 0 || io_threads > kMaxIoThreads || max_inflight <= 0 ||
+        max_inflight > kMaxInflight || cache_rows < 0)
       throw std::invalid_argument(
-          "io_threads and max_inflight must be > 0, cache_rows >= 0");
-    if (wait_timeout_s <= 0)
+          "io_threads must be in [1, 1024], max_inflight in [1, 65536] and "
+          "cache_rows >= 0");
+    if (!(wait_timeout_s > 0))
       throw std::invalid_argument("wait_timeout_s must be > 0");
+    if (paths.size() > kMaxFiles)
+      throw std::invalid_argument(
+          "at most 2047 table files are supported, got " +
+          std::to_string(paths.size()));
     if (!remote_server.empty()) {
       remote_make_ = find_remote_backend(remote_backend);
       if (remote_make_ == nullptr) {
@@ -278,14 +368,21 @@ class Core {
             "' is not compiled into this reader (compiled in: " +
             (names.empty() ? "none" : names) + ")");
       }
-      if (remote_max_inflight <= 0 || remote_region_bytes <= 0 ||
-          remote_upload_chunk_bytes <= 0 || remote_connect_timeout_s <= 0)
+      if (remote_max_inflight <= 0 || remote_max_inflight > kMaxInflight ||
+          remote_max_batch_rows <= 0 || remote_max_batch_rows > kMaxBatchRows ||
+          remote_region_bytes < row_bytes || remote_upload_chunk_bytes <= 0 ||
+          remote_upload_chunk_bytes > (int64_t{1} << 34) ||
+          !(remote_connect_timeout_s > 0))
         throw std::invalid_argument(
-            "remote max_inflight, region_bytes, upload_chunk_bytes and "
-            "connect_timeout_s must be > 0");
+            "remote max_inflight must be in [1, 65536], max_batch_rows in "
+            "[1, 1024], region_bytes >= row_bytes, upload_chunk_bytes in "
+            "[1, 16 GiB] and connect_timeout_s > 0");
       ple_remote::Params& p = remote_.params;
       p.address = remote_server;
       p.max_inflight = static_cast<uint32_t>(remote_max_inflight);
+      p.max_batch_rows = static_cast<uint32_t>(remote_max_batch_rows);
+      p.token_file = remote_token_file;
+      p.allow_insecure_transport = remote_allow_insecure_transport;
       p.region_rows =
           std::max<uint64_t>(1, uint64_t(remote_region_bytes) / rb_);
       p.chunk_rows =
@@ -343,30 +440,34 @@ class Core {
     slab_ = static_cast<uint8_t*>(slab);
     for (uint32_t s = slots_; s-- > 0;) free_slots_.push_back(s);
     cache_.init(static_cast<uint64_t>(cache_rows), rb_);
+    num_workers_ = static_cast<size_t>(io_threads);
     if (remote_make_ != nullptr) start_remote();
     planner_ = std::thread([this] { planner_loop(); });
-    num_workers_ = static_cast<size_t>(io_threads);
     for (int64_t i = 0; i < io_threads; ++i)
       workers_.emplace_back([this] { worker_loop(); });
   }
 
   ~Core() { close(); }
 
+  // Fails every pending job, waits for API callers and delivering threads,
+  // then frees the buffers. Idempotent.
   void close() {
     {
       std::lock_guard<std::mutex> lk(mu_);
       if (closed_) return;
       closed_ = true;
+      if (error_.empty()) error_ = "PLE disk reader closed";
     }
     cv_work_.notify_all();
     cv_plan_.notify_all();
-    remote_.cv.notify_all();
+    cv_done_.notify_all();
+    remote_.wake();
     if (planner_.joinable()) planner_.join();
     for (auto& t : workers_) t.join();
     workers_.clear();
     if (remote_src_) remote_src_->stop();
     {
-      std::lock_guard<std::mutex> lk(mu_);
+      std::unique_lock<std::mutex> lk(mu_);
       for (auto* q : {&demand_q_, &hint_q_, &rdemand_q_, &rhint_q_}) {
         for (auto& r : *q) {
           if (r->finished) continue;
@@ -387,25 +488,27 @@ class Core {
       plan_q_.clear();
       hint_inbox_.clear();
       inflight_.clear();
-      bound_latest_.reset();
+      bound_job_.reset();
+      bound_last_.reset();
       remote_.ready_rows.store(0);
-      if (error_.empty()) error_ = "PLE disk reader closed";
+      cv_done_.notify_all();
+      cv_done_.wait(lk, [&] { return api_calls_ == 0; });
     }
-    cv_done_.notify_all();
     close_fds();
     std::free(slab_);
     slab_ = nullptr;
+    std::lock_guard<std::mutex> lk(mu_);
     cache_.init(0, rb_);
   }
 
   void read_rows(uint64_t ids, int64_t n, uint64_t out) {
+    ApiCall call(*this, true);
     auto job = std::make_shared<Job>();
     job->ids = reinterpret_cast<const int64_t*>(ids);
     job->n = static_cast<size_t>(n);
     job->dst = reinterpret_cast<uint8_t*>(out);
     {
       std::lock_guard<std::mutex> lk(mu_);
-      if (closed_) throw std::runtime_error("PLE disk reader is closed");
       ++stats_.demand_jobs;
     }
     plan(job.get(), job);
@@ -416,27 +519,45 @@ class Core {
       throw std::runtime_error("PLE disk read failed: " + error_);
   }
 
+  // Accepts as many of the ids as the hint inbox has room for.
   void hint(uint64_t ids, int64_t n) {
-    if (n <= 0 || !cache_.enabled()) return;
-    const int64_t* p = reinterpret_cast<const int64_t*>(ids);
-    std::vector<int64_t> v(p, p + n);
+    if (n <= 0) return;
+    ApiCall call(*this, false);
+    size_t take;
     {
       std::lock_guard<std::mutex> lk(mu_);
-      if (closed_) return;
+      if (!call.entered() || !cache_.enabled()) return;
       stats_.hint_rows += static_cast<uint64_t>(n);
-      if (hint_inbox_rows_ + v.size() > kHintInboxRows) {
-        stats_.hint_dropped += static_cast<uint64_t>(n);
-        return;
-      }
-      hint_inbox_rows_ += v.size();
+      take = std::min<size_t>(static_cast<size_t>(n),
+                              kHintInboxRows - hint_inbox_rows_);
+      stats_.hint_dropped += static_cast<uint64_t>(n) - take;
+      hint_inbox_rows_ += take;
+    }
+    if (take == 0) return;
+    const int64_t* p = reinterpret_cast<const int64_t*>(ids);
+    std::vector<int64_t> v(p, p + take);
+    {
+      std::lock_guard<std::mutex> lk(mu_);
       hint_inbox_.push_back(std::move(v));
     }
     cv_plan_.notify_one();
   }
 
+  // Rebinding first lets the latest bound job finish (or cancels it after
+  // the wait timeout), so the old buffers are never written afterwards; a
+  // wait for a job notified before the rebind then fails.
   void bind(uint64_t ids, uint64_t num_tokens, uint64_t out, int64_t max_tokens,
             int64_t heads) {
-    std::lock_guard<std::mutex> lk(mu_);
+    std::unique_lock<std::mutex> lk(mu_);
+    if (closed_) throw std::runtime_error("PLE disk reader is closed");
+    if (bound_last_) {
+      JobPtr job = std::move(bound_last_);
+      const bool done = cv_done_.wait_for(
+          lk, std::chrono::microseconds(static_cast<int64_t>(timeout_us_)),
+          [&] { return job->pending == 0 || closed_; });
+      if (!done || job->pending != 0) cancel_locked(job, lk);
+      bound_job_.reset();
+    }
     bound_ids_ = reinterpret_cast<const int64_t*>(ids);
     bound_num_tokens_ = reinterpret_cast<const int64_t*>(num_tokens);
     bound_out_ = reinterpret_cast<uint8_t*>(out);
@@ -463,6 +584,10 @@ class Core {
                                std::to_string(rc));
   }
 
+  // When false, a failed demand job in a stream wait is only recorded (see
+  // error()) instead of aborting the process. For tests.
+  void set_abort_on_stream_failure(bool abort) { abort_on_failure_ = abort; }
+
   std::string error() {
     std::lock_guard<std::mutex> lk(mu_);
     return error_;
@@ -472,12 +597,15 @@ class Core {
     Stats s;
     std::vector<float> lat, rlat;
     bool direct;
+    uint64_t capacity, requests;
     {
       std::lock_guard<std::mutex> lk(mu_);
       s = stats_;
       lat = latency_.v;
       rlat = remote_latency_.v;
       direct = direct_;
+      capacity = cache_.capacity();
+      requests = remote_.requests.load() - requests_base_;
     }
     py::dict d;
     d["requests"] = s.requests;
@@ -494,10 +622,11 @@ class Core {
     d["demand_wait_us"] = s.demand_wait_us;
     d["read_us_p50"] = percentile(lat, 0.5);
     d["read_us_p99"] = percentile(lat, 0.99);
-    d["cache_capacity"] = cache_.capacity();
+    d["cache_capacity"] = capacity;
     d["direct_io"] = direct;
     d["remote_reads"] = s.remote_reads;
     d["remote_bytes"] = s.remote_bytes;
+    d["remote_requests"] = requests;
     d["remote_read_us_p50"] = percentile(rlat, 0.5);
     d["remote_read_us_p99"] = percentile(rlat, 0.99);
     d["remote_requeued"] = s.remote_requeued;
@@ -509,6 +638,7 @@ class Core {
     stats_ = Stats{};
     latency_.clear();
     remote_latency_.clear();
+    requests_base_ = remote_.requests.load();
   }
 
   py::dict remote_status() {
@@ -556,8 +686,33 @@ class Core {
     return !rdemand_q_.empty() || !rhint_q_.empty();
   }
 
-  void complete_remote_read(const ReadPtr& r, const uint8_t* row, double us) {
-    finish_read(r, row, rb_, 0, us, -1);
+  // Delivers a batch of remote rows with two lock acquisitions in total.
+  void complete_remote_reads(
+      std::vector<ple_remote::Delivered<ReadPtr>>& batch) {
+    std::unique_lock<std::mutex> lk(mu_);
+    for (auto& d : batch) {
+      PageRead& r = *d.read;
+      auto it = inflight_.find(r.key);
+      if (it != inflight_.end() && it->second == d.read) inflight_.erase(it);
+      r.finished = true;
+      mark_live_locked(r.uses);
+    }
+    lk.unlock();
+    for (auto& d : batch) {
+      for (const Use& u : d.read->uses)
+        if (u.live) std::memcpy(u.dst, d.row, rb_);
+      cache_.insert(d.read->offset, d.row);
+    }
+    lk.lock();
+    bool notify = false;
+    for (auto& d : batch) {
+      ++stats_.remote_reads;
+      stats_.remote_bytes += rb_;
+      remote_latency_.add(d.us);
+      notify |= release_uses_locked(d.read->uses, 0, rb_);
+    }
+    lk.unlock();
+    if (notify) cv_done_.notify_all();
   }
 
   void requeue_remote_reads(const std::vector<ReadPtr>& reads) {
@@ -596,63 +751,133 @@ class Core {
   }
 
  private:
+  // Counts a Python API call so close() can wait for it before freeing the
+  // cache; `required` makes a closed reader raise instead of skipping.
+  class ApiCall {
+   public:
+    ApiCall(Core& core, bool required) : core_(core) {
+      std::lock_guard<std::mutex> lk(core_.mu_);
+      if (core_.closed_) {
+        if (required) throw std::runtime_error("PLE disk reader is closed");
+        return;
+      }
+      entered_ = true;
+      ++core_.api_calls_;
+    }
+    ~ApiCall() {
+      if (!entered_) return;
+      std::lock_guard<std::mutex> lk(core_.mu_);
+      if (--core_.api_calls_ == 0 && core_.closed_) core_.cv_done_.notify_all();
+    }
+    bool entered() const { return entered_; }
+
+   private:
+    Core& core_;
+    bool entered_ = false;
+  };
+
   static void notify_cb(void* p) {
+    auto* core = static_cast<Core*>(p);
     try {
-      static_cast<Core*>(p)->on_notify();
-    } catch (...) {
+      core->on_notify();
+    } catch (const std::exception& e) {
+      std::lock_guard<std::mutex> lk(core->mu_);
+      core->set_error_locked(std::string("PLE demand notify failed: ") +
+                             e.what());
     }
   }
   static void wait_cb(void* p) {
+    auto* core = static_cast<Core*>(p);
     try {
-      static_cast<Core*>(p)->on_wait();
-    } catch (...) {
+      core->on_wait();
+    } catch (const std::exception& e) {
+      core->fail_stream(std::string("PLE demand wait failed: ") + e.what());
     }
   }
 
+  // Starts the demand job for the bound buffers. A job notified earlier and
+  // never waited is cancelled first, so it cannot write the buffers anymore.
   void on_notify() {
     {
-      std::lock_guard<std::mutex> lk(mu_);
+      std::unique_lock<std::mutex> lk(mu_);
       if (closed_ || bound_ids_ == nullptr) return;
+      if (bound_job_) cancel_locked(bound_job_, lk);
       const int64_t n =
           std::clamp<int64_t>(*bound_num_tokens_, 0, bound_max_tokens_);
       auto job = std::make_shared<Job>();
       job->ids = bound_ids_;
       job->n = static_cast<size_t>(n * bound_heads_);
       job->dst = bound_out_;
-      bound_latest_ = job;
+      bound_job_ = job;
+      bound_last_ = job;
       ++stats_.demand_jobs;
       plan_q_.push_back(std::move(job));
     }
     cv_plan_.notify_one();
   }
 
+  // Blocks the stream until the job of the matching notify completed. The
+  // stream must not run on with missing or stale rows, so a wait without a
+  // fresh notify, a failed job or a timeout fails closed (fail_stream). A
+  // reader closed by its owner just lets the stream go.
   void on_wait() {
     std::unique_lock<std::mutex> lk(mu_);
-    JobPtr job = bound_latest_;
-    if (!job || job->waited) return;
-    job->waited = true;
-    wait_job(job, lk);
+    if (closed_) return;
+    JobPtr job = std::move(bound_job_);
+    bound_job_.reset();
+    if (!job) {
+      lk.unlock();
+      return fail_stream(
+          "PLE demand wait without a matching notify (the bound rows are "
+          "stale)");
+    }
+    const bool ok = wait_job(job, lk);
+    if (closed_ || (ok && !job->failed)) return;
+    const std::string err = error_.empty() ? "PLE disk read failed" : error_;
+    lk.unlock();
+    fail_stream(err);
   }
 
-  // Waits (lock held) for `job` to finish; on timeout records an error,
-  // cancels the job so late reads no longer touch its buffer, returns false.
+  void fail_stream(const std::string& msg) {
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      set_error_locked(msg);
+    }
+    if (!abort_on_failure_.load()) return;
+    std::fprintf(stderr,
+                 "FATAL: vLLM PLE disk reader: %s. Aborting: the CUDA stream "
+                 "cannot continue with missing PLE rows.\n",
+                 msg.c_str());
+    std::fflush(stderr);
+    std::abort();
+  }
+
+  // Lock held. Stops late reads from writing `job`'s buffer and waits for
+  // the ones writing it now.
+  void cancel_locked(const JobPtr& job, std::unique_lock<std::mutex>& lk) {
+    job->cancelled = true;
+    job->failed = true;
+    cv_done_.wait(lk, [&] { return job->writers == 0; });
+  }
+
+  // Waits (lock held) for `job` to finish. When the reader closes first, the
+  // job is cancelled and failed. On timeout records an error, cancels the job
+  // so late reads no longer touch its buffer, and returns false.
   bool wait_job(const JobPtr& job, std::unique_lock<std::mutex>& lk) {
     const double t0 = now_us();
     const bool ok = cv_done_.wait_for(
         lk, std::chrono::microseconds(static_cast<int64_t>(timeout_us_)),
         [&] { return job->pending == 0 || closed_; });
     stats_.demand_wait_us += now_us() - t0;
-    if (ok && job->pending == 0) return true;
+    if (job->pending == 0) return true;
     if (ok) {
-      job->failed = true;
+      cancel_locked(job, lk);
       return true;
     }
     ++stats_.timeouts;
     set_error_locked("PLE disk read timed out after " +
                      std::to_string(timeout_us_ / 1e6) + " s");
-    job->cancelled = true;
-    job->failed = true;
-    cv_done_.wait(lk, [&] { return job->writers == 0; });
+    cancel_locked(job, lk);
     return false;
   }
 
@@ -777,7 +1002,7 @@ class Core {
       if (demand && finish_pending(job, 1)) cv_done_.notify_all();
       if (demand && job->writers == 0 && job->cancelled) cv_done_.notify_all();
     }
-    if (queued_remote) remote_.cv.notify_one();
+    if (queued_remote) remote_.wake();
     notify_workers(queued);
   }
 
@@ -830,7 +1055,7 @@ class Core {
         stats_.hint_dropped += group;
         return nullptr;
       }
-      r = std::make_shared<PageRead>();
+      r = read_pool_.make();
       r->key = m.key;
       r->file = m.file;
       r->offset = m.remote ? m.row : m.offset;
@@ -905,71 +1130,71 @@ class Core {
     }
   }
 
-  // Delivers a finished read (`got` bytes at `buf`) to its uses: copies to
-  // live jobs, fills the cache, updates stats and pending counts. Takes mu_.
-  // `slot` is the disk slab slot to return, or -1 for a remote read.
+  // Lock held. Marks the uses whose job still takes the bytes and counts
+  // them as writers of that job.
+  static void mark_live_locked(std::vector<Use>& uses) {
+    for (Use& u : uses) {
+      u.live = u.job && !u.job->cancelled;
+      if (u.live) ++u.job->writers;
+    }
+  }
+
+  // Lock held. Settles the uses of a delivered read (`got` bytes, `err`):
+  // ends their writes, fails the jobs of short rows, counts them done.
+  // Returns true when a waiter needs a notify.
+  bool release_uses_locked(std::vector<Use>& uses, int err, size_t got) {
+    bool notify = false;
+    for (Use& u : uses) {
+      Job* job = u.job.get();
+      if (job == nullptr) continue;
+      if (u.live && --job->writers == 0 && job->cancelled) notify = true;
+      if (err != 0 || u.in_page + rb_ > got) job->failed = true;
+      if (finish_pending(job, 1)) notify = true;
+    }
+    uses.clear();
+    return notify;
+  }
+
+  // Delivers a finished disk read (`got` bytes at `buf`) to its uses: copies
+  // to live jobs, fills the cache, updates stats and pending counts. Takes
+  // mu_. Once `finished` is set no other thread touches `uses`.
   void finish_read(const ReadPtr& r, const uint8_t* buf, size_t got, int err,
                    double us, int slot) {
     std::unique_lock<std::mutex> lk(mu_);
     auto it = inflight_.find(r->key);
     if (it != inflight_.end() && it->second == r) inflight_.erase(it);
     r->finished = true;
-    std::vector<Use> uses = std::move(r->uses);
-    std::vector<char> live(uses.size(), 0);
-    for (size_t i = 0; i < uses.size(); ++i) {
-      if (uses[i].job && !uses[i].job->cancelled) {
-        ++uses[i].job->writers;
-        live[i] = 1;
-      }
-    }
+    mark_live_locked(r->uses);
     lk.unlock();
 
     bool short_row = false;
-    std::vector<char> bad(uses.size(), 0);
-    for (size_t i = 0; i < uses.size(); ++i) {
-      const Use& u = uses[i];
-      const bool ok = err == 0 && u.in_page + rb_ <= got;
-      if (!ok) {
-        bad[i] = 1;
+    for (const Use& u : r->uses) {
+      if (err != 0 || u.in_page + rb_ > got) {
         short_row = true;
-        if (live[i]) std::memset(u.dst, 0, rb_);
+        if (u.live) std::memset(u.dst, 0, rb_);
         continue;
       }
-      if (live[i]) std::memcpy(u.dst, buf + u.in_page, rb_);
+      if (u.live) std::memcpy(u.dst, buf + u.in_page, rb_);
       cache_.insert(u.row, buf + u.in_page);
     }
 
     lk.lock();
-    if (r->remote) {
-      ++stats_.remote_reads;
-      stats_.remote_bytes += got;
-      remote_latency_.add(us);
-    } else {
-      free_slots_.push_back(static_cast<uint32_t>(slot));
-      ++stats_.reads;
-      stats_.bytes += got;
-      latency_.add(us);
-      if (err != 0) {
-        set_error_locked("pread failed at offset " + std::to_string(r->offset) +
-                         ": " + strerror(err));
-      } else if (short_row) {
-        set_error_locked("short read at offset " + std::to_string(r->offset) +
-                         " (" + std::to_string(got) + " of " +
-                         std::to_string(r->length) +
-                         " bytes): file truncated?");
-      }
+    free_slots_.push_back(static_cast<uint32_t>(slot));
+    ++stats_.reads;
+    stats_.bytes += got;
+    latency_.add(us);
+    if (err != 0) {
+      set_error_locked("pread failed at offset " + std::to_string(r->offset) +
+                       ": " + strerror(err));
+    } else if (short_row) {
+      set_error_locked("short read at offset " + std::to_string(r->offset) +
+                       " (" + std::to_string(got) + " of " +
+                       std::to_string(r->length) + " bytes): file truncated?");
     }
-    bool notify = false;
-    for (size_t i = 0; i < uses.size(); ++i) {
-      Job* job = uses[i].job.get();
-      if (job == nullptr) continue;
-      if (live[i] && --job->writers == 0 && job->cancelled) notify = true;
-      if (bad[i]) job->failed = true;
-      if (finish_pending(job, 1)) notify = true;
-    }
+    const bool notify = release_uses_locked(r->uses, err, got);
+    if (!demand_q_.empty() || !hint_q_.empty()) cv_work_.notify_one();
+    lk.unlock();
     if (notify) cv_done_.notify_all();
-    if (!r->remote && (!demand_q_.empty() || !hint_q_.empty()))
-      cv_work_.notify_one();
   }
 
   // Reads up to `length` bytes, stopping at EOF. Falls back to buffered I/O
@@ -1063,6 +1288,8 @@ class Core {
   uint8_t* slab_ = nullptr;
   uint32_t slots_ = 0;
   RowCache cache_;
+  // Before every container of ReadPtr, so it is destroyed after them.
+  ReadPool read_pool_;
 
   std::mutex mu_;
   std::condition_variable cv_work_, cv_plan_, cv_done_;
@@ -1086,8 +1313,12 @@ class Core {
   uint8_t* bound_out_ = nullptr;
   int64_t bound_max_tokens_ = 0;
   int64_t bound_heads_ = 0;
-  JobPtr bound_latest_;
+  JobPtr bound_job_;   // notified, not yet waited
+  JobPtr bound_last_;  // latest notified
   std::atomic<bool> host_funcs_launched_{false};
+  std::atomic<bool> abort_on_failure_{true};
+  size_t api_calls_ = 0;
+  uint64_t requests_base_ = 0;
 
   size_t num_workers_ = 0;
   std::thread planner_;
@@ -1187,7 +1418,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
                     const std::vector<int64_t>&, const std::vector<int64_t>&,
                     int64_t, int64_t, int64_t, int64_t, bool, double,
                     const std::string&, const std::string&, int64_t, int64_t,
-                    int64_t, double, bool>(),
+                    int64_t, double, bool, int64_t, const std::string&, bool>(),
            Release())
       .def("close", &Reader::close, Release())
       .def(
@@ -1213,6 +1444,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
             r.core().launch(stream, wait);
           },
           Release())
+      .def("set_abort_on_stream_failure",
+           [](Reader& r, bool abort) {
+             r.core().set_abort_on_stream_failure(abort);
+           })
       .def("error", [](Reader& r) { return r.core().error(); })
       .def("direct_io", [](Reader& r) { return r.core().direct_io(); })
       .def("stats", [](Reader& r) { return r.core().stats(); })
